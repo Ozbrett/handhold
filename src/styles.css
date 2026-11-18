@@ -1124,6 +1124,22 @@ p.empty {
   color: var(--accent);
 }
 
+#wrist-test {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  font-size: 0.8rem;
+}
+
+#wrist-test[hidden] {
+  display: none;
+}
+
+#wrist-test input {
+  width: 6.5rem;
+  vertical-align: middle;
+}
+
 #view-toggles .chip[hidden] {
   display: none;
 }

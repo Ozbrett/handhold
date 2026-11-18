@@ -27,6 +27,7 @@ import {
   Scene,
   ShadowMaterial,
   SkeletonHelper,
+  type SkinnedMesh,
   SphereGeometry,
   Sphere,
   TorusGeometry,
@@ -39,6 +40,7 @@ import { TransformControls } from 'three/examples/jsm/controls/TransformControls
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { Contact } from '../core/grasp/quality';
 import { type HandPose, type RiggedHand, mixPose, setHandPose } from './handRig';
+import { type ArmBones, followColours } from './skinCheck';
 
 export interface ViewOptions {
   bones: boolean;
@@ -81,6 +83,8 @@ export class Viewer {
   private character: Object3D | null = null;
   /** The character's own skeleton, drawn through its skin in character view when Bones is on. */
   private characterBones: SkeletonHelper | null = null;
+  /** The character's arms, for the whole-body weights view (red follows a hand, blue stays with the forearm). */
+  private characterArms: ArmBones[] = [];
   characterView = false;
   private readonly gizmo: TransformControls;
   private readonly gizmoProxy = new Object3D();
@@ -304,6 +308,7 @@ export class Viewer {
       this.characterBones = null;
     }
     this.character = root;
+    this.characterArms = [];
     if (root) {
       root.visible = false;
       this.scene.add(root);
@@ -335,6 +340,7 @@ export class Viewer {
     if (this.characterView && stageMatrix) this.stage.matrix.copy(stageMatrix);
     else this.stage.matrix.identity();
     this.stage.updateMatrixWorld(true);
+    this.applyCharacterWeights();
     this.applyVisibility();
     this.invalidate();
   }
@@ -379,8 +385,46 @@ export class Viewer {
     this.invalidate();
   }
 
+  /** The arms the whole-body weights view colours (see skinCheck.followColours). */
+  setCharacterArms(arms: ArmBones[]) {
+    this.characterArms = arms;
+    this.applyWeightsView();
+    this.invalidate();
+  }
+
+  /**
+   * In character view, Weights colours every mesh of the character by how much it follows a hand: red the hand, blue the forearm.
+   * A red cuff turns with the wrist; that is what Rig Doctor's --cuff step takes away.
+   */
+  private applyCharacterWeights() {
+    const root = this.character;
+    if (!root) return;
+    const on = this.view.weights && this.characterView && this.characterArms.length > 0;
+    if (on && !this.weightMaterial) this.weightMaterial = new MeshStandardMaterial({ vertexColors: true, roughness: 0.85 });
+    root.traverse((o) => {
+      const mesh = o as SkinnedMesh;
+      if (!mesh.isSkinnedMesh) return;
+      const g = mesh.geometry;
+      if (on) {
+        if (mesh.userData.plainMaterial === undefined) {
+          mesh.userData.plainMaterial = mesh.material;
+          mesh.userData.plainColor = g.getAttribute('color') ?? null;
+        }
+        g.setAttribute('color', new BufferAttribute(followColours(mesh, this.characterArms), 3));
+        mesh.material = this.weightMaterial!;
+      } else if (mesh.userData.plainMaterial !== undefined) {
+        mesh.material = mesh.userData.plainMaterial;
+        if (mesh.userData.plainColor) g.setAttribute('color', mesh.userData.plainColor);
+        else g.deleteAttribute('color');
+        delete mesh.userData.plainMaterial;
+        delete mesh.userData.plainColor;
+      }
+    });
+  }
+
   /** Swaps the hand's materials for one that shows, in colour, which bone each vertex follows. */
   private applyWeightsView() {
+    this.applyCharacterWeights();
     const hand = this.hand;
     if (!hand) return;
     const on = this.view.weights;

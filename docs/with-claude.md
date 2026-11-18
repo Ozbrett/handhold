@@ -176,6 +176,8 @@ Unity -batchmode -nographics -quit -projectPath P -executeMethod HandholdCheck.R
 
 [development.md](development.md) explains how to produce the fixture these read. There is no such check for Godot yet.
 
+Before a grip, Claude can check the character itself. A second skill, `.claude/skills/rig-doctor`, runs [Rig Doctor](rig-doctor.md): it measures the sleeve over the hand, the cuff weights and how thick the wrist stays when the hand rolls and bends, fixes what fails, and renders a before and after sheet to look at. Ask "the wrists contort when my character holds the gun, fix the model". Copy that skill into a game project the same way as this one.
+
 ## Things worth knowing
 
 - The grip point is given as fractions of the prop's bounding box, in the file's own axes. A handle at one end of a long prop is about `0.25` along its longest axis and `0.5` on the other two. If you know which end the handle is, say so.

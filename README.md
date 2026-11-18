@@ -103,6 +103,12 @@ node scripts/handhold.mjs --hand character.glb --object rifle.glb --grip 0.3,0.5
 
 Every option is in [command-line.md](docs/command-line.md).
 
+A grip is only as good as the wrist it is on. [Rig Doctor](docs/rig-doctor.md) checks a character's skin at the wrists (sleeves over the hand, cuffs weighted to the hand, a wrist that pinches when it turns) and fixes it, headless in Blender:
+
+```bash
+node scripts/rig-doctor.mjs fix character.blend --save character_fixed.blend --shots out/wrists
+```
+
 ## Limits
 
 Handhold needs open hands with separate fingers: fists, mittens and fused fingers are not rigged. It is built around the palm, so it does not find precision pinches such as holding a pen. Arm posing needs a plain upper arm, forearm and hand chain.

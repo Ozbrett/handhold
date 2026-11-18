@@ -33,6 +33,7 @@ import {
   motionLoops,
 } from './app/animations';
 import { Viewer } from './app/viewer';
+import { type ArmBones, mainChild, turnWrist } from './app/skinCheck';
 
 interface HandEntry {
   name: string;
@@ -599,6 +600,8 @@ function sync() {
     charChip.hidden = !hand?.char || !grasps?.length;
     charChip.setAttribute('aria-pressed', String(characterView && !charChip.hidden));
   }
+  const wristChip = document.getElementById('toggle-wrist-test');
+  if (wristChip) wristChip.hidden = !(characterView && hand?.char && grasps?.length);
   ui.thumbTurn = hand?.edits.thumbTurn ?? 0;
   ui.edited = !!hand && (Object.keys(hand.edits.joints).length > 0 || hand.edits.thumbTurn !== 0);
   ui.armAvailable = !!hand?.arm;
@@ -718,12 +721,34 @@ function applyCharacterView(frame = true) {
   viewer.setArcGuide(
     editing && ui.tab === 'grip' && sweepFrom && sweepTo ? Array.from({ length: 25 }, (_, i) => mixHold(arm!, sweepFrom!, sweepTo!, i / 24).position) : null,
   );
+  applyWristTest(on);
   if (!frame || !hand || !object || !g) return;
   const box = on
     ? hand.restBox.clone().applyMatrix4(carried).union(object.box.clone().applyMatrix4(toHand!))
     : object.box.clone().union(hand.restBox.clone().applyMatrix4(g.wrist));
   if (editing) box.expandByPoint(arm!.shoulder);
   viewer.frameBox(box, 500);
+}
+
+/** The character's arms, upper arm to hand: the holding arm, then the other one (or the second hand's). */
+function characterArms(): ArmBones[] {
+  const out: ArmBones[] = [];
+  if (hand?.arm) out.push({ upper: hand.arm.upper, fore: hand.arm.fore, hand: hand.arm.hand });
+  if (support?.arm) out.push({ upper: support.arm.upper, fore: support.arm.fore, hand: support.arm.hand });
+  else if (hand?.free) {
+    const h = mainChild(hand.free.fore);
+    if (h) out.push({ upper: hand.free.upper, fore: hand.free.fore, hand: h });
+  }
+  return out;
+}
+
+/** The wrist test (view chips): every hand rolled and bent on its forearm, on top of the hold, to see the skin at the wrist. */
+const wristTest = { on: false, roll: 0, bend: 0 };
+function applyWristTest(on: boolean) {
+  const arms = on ? characterArms() : [];
+  viewer.setCharacterArms(arms);
+  if (wristTest.on) for (const a of arms) turnWrist(a, wristTest.roll, wristTest.bend);
+  viewer.invalidate();
 }
 
 /** Can the model's other hand join in? Needs a character with two hands, both with arms. */
@@ -1683,7 +1708,7 @@ viewer.onPick = (point, normal) => {
 {
   const host = document.getElementById('view-toggles')!;
   const items: { key: 'bones' | 'fit' | 'contacts' | 'weights'; label: string; title: string }[] = [
-    { key: 'weights', label: 'Weights', title: 'Colour the hand by which bone each part of the skin follows' },
+    { key: 'weights', label: 'Weights', title: 'Colour the hand by which bone each part of the skin follows. On your model: red follows the hand, blue stays with the forearm' },
     { key: 'bones', label: 'Bones', title: 'Show the bones that were placed in the hand' },
     { key: 'fit', label: 'Fit', title: 'Show how the bones were inflated to fill the hand' },
     { key: 'contacts', label: 'Contacts', title: 'Show where the hand touches the object' },
@@ -1717,6 +1742,43 @@ viewer.onPick = (point, normal) => {
     sync();
   });
   host.prepend(c);
+  // the wrist test: roll and bend every hand on its forearm, to see what the skin does at the wrist (Rig Doctor checks the same turns)
+  const w = document.createElement('button');
+  w.type = 'button';
+  w.className = 'chip';
+  w.id = 'toggle-wrist-test';
+  w.textContent = 'Wrist test';
+  w.title = 'Roll and bend the hands on your model to see how the skin at the wrist follows';
+  w.hidden = true;
+  w.setAttribute('aria-pressed', 'false');
+  const sliders = document.createElement('div');
+  sliders.id = 'wrist-test';
+  sliders.hidden = true;
+  const slider = (label: string, key: 'roll' | 'bend', max: number) => {
+    const l = document.createElement('label');
+    l.textContent = label + ' ';
+    const r = document.createElement('input');
+    r.type = 'range';
+    r.min = String(-max);
+    r.max = String(max);
+    r.step = '5';
+    r.value = '0';
+    r.addEventListener('input', () => {
+      wristTest[key] = Number(r.value);
+      applyCharacterView(false);
+    });
+    l.appendChild(r);
+    sliders.appendChild(l);
+  };
+  slider('Roll', 'roll', 90);
+  slider('Bend', 'bend', 60);
+  w.addEventListener('click', () => {
+    wristTest.on = !wristTest.on;
+    w.setAttribute('aria-pressed', String(wristTest.on));
+    sliders.hidden = !wristTest.on;
+    applyCharacterView(false);
+  });
+  host.append(w, sliders);
 }
 
 // ---------- drag and drop anywhere ----------
