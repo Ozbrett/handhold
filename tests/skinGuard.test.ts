@@ -49,6 +49,29 @@ describe('skin guard', () => {
     expect(near.length).toBeGreaterThanOrEqual(4);
   });
 
+  it("the contacts shown for a cleared grip are where the drawn skin touches the part, not where the solver's spheres were", async () => {
+    const object = graspObject(new BoxGeometry(0.03, 0.11, 0.05, 3, 8, 4));
+    const grasps = await solveGrasp(hand.model, object, { gripPoint: new Vector3(0.015, 0, 0), gripNormal: new Vector3(1, 0, 0) });
+    const g = grasps[0];
+    const guard = new SkinGuard(hand, object);
+    const r = guard.clear(g.wrist, g.angles);
+    const shown = guard.contacts(r.wrist, r.angles);
+    const skin = (guard as unknown as { P: Float32Array }).P;
+    const nearSkin = (q: Vector3) => {
+      let best = Infinity;
+      for (let i = 0; i < skin.length; i += 3) best = Math.min(best, Math.hypot(skin[i] - q.x, skin[i + 1] - q.y, skin[i + 2] - q.z));
+      return best;
+    };
+    expect(shown.some((c) => c.finger >= 0 && hand.model.fingers[c.finger].isThumb)).toBe(true);
+    expect(new Set(shown.filter((c) => c.finger >= 0).map((c) => c.finger)).size).toBeGreaterThanOrEqual(3);
+    for (const c of shown) {
+      expect(object.distance(c.point.x, c.point.y, c.point.z)).toBeLessThan(1e-4);
+      expect(nearSkin(c.point)).toBeLessThanOrEqual(0.0025);
+    }
+    // the solver's own contacts, drawn on the cleared hand, miss the skin: that is what the site showed before
+    expect(Math.max(...g.contacts.map((c) => nearSkin(c.point)))).toBeGreaterThan(0.0025);
+  });
+
   it('a hand put 15 mm into a stick by whoever placed it is moved out and closed on it again', async () => {
     const object = graspObject(new CylinderGeometry(0.017, 0.017, 0.3, 24, 12));
     const grasps = await solveGrasp(hand.model, object, { gripPoint: new Vector3(0.017, 0, 0), gripNormal: new Vector3(1, 0, 0) });

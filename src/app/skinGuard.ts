@@ -1,3 +1,4 @@
+import type { Contact } from '../core/grasp/quality';
 import { BufferAttribute, BufferGeometry, Matrix4, Vector3 } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
 import type { GraspObject } from '../core/grasp/object';
@@ -466,6 +467,40 @@ export class SkinGuard {
       gap[part] = Math.min(gap[part], e.gap);
     }
     return { depth, worst: Math.max(...Object.values(depth)), gap };
+  }
+
+  /**
+   * Where the drawn skin touches the held thing with the hand at `wrist`: on each finger segment and the palm, the skin point nearest the part, if it is within
+   * `within` of it (metres). These are the hand's real contacts, where the solver's are its collision spheres', which sit inside the skin and stop being
+   * where the fingers are once the hand has been moved out of the part.
+   */
+  contacts(wrist: Matrix4, angles: Float32Array, within = 0.002): Contact[] {
+    this.place(wrist, angles);
+    const palm = this.hand.model.fingers.length;
+    const lo = this.objMin, hi = this.objMax, m = within + 0.001;
+    const best = new Map<number, { d: number; id: number }>();
+    for (let p = 0; p < this.pieces.length; p++) {
+      const piece = this.pieces[p];
+      this.refit(piece);
+      for (let i = 0; i < piece.verts.length; i++) {
+        const id = piece.verts[i];
+        if (this.pieceOf(id) !== p) continue;
+        const x = this.P[id * 3], y = this.P[id * 3 + 1], z = this.P[id * 3 + 2];
+        if (x < lo.x - m || y < lo.y - m || z < lo.z - m || x > hi.x + m || y > hi.y + m || z > hi.z + m) continue;
+        const d = this.object.distance(x, y, z);
+        if (d > within) continue;
+        const key = p * 8 + (p === palm ? 0 : this.vLink[id]);
+        const was = best.get(key);
+        if (!was || d < was.d) best.set(key, { d, id });
+      }
+    }
+    const out: Contact[] = [];
+    for (const [key, { id }] of best) {
+      const p = Math.floor(key / 8);
+      this.object.distance(this.P[id * 3], this.P[id * 3 + 1], this.P[id * 3 + 2]);
+      out.push({ point: this.object.lastPoint.clone(), normal: this.object.lastNormal.clone(), finger: p === palm ? -1 : p, link: key % 8 });
+    }
+    return out;
   }
 
   /** Takes the hand out of the held thing (see the class comment). */

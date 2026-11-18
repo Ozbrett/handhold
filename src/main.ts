@@ -10,6 +10,7 @@ import { type HandModel, type JointDof, openPose } from './core/hand/model';
 import { type ArmRig, BODY_LIMITS, type FreeArm, findOtherArm, hangArm, type BodyLimits, type HoldPose, type WristReport, buildArmRig, setBodyLimits, clampToReach, defaultHold, holdGap, letGo, meetHold, mixHold, reachOf, solveArm } from './app/armIk';
 import { type BoneHinge, type CharacterRig, buildCharacterRig, poseCharacter, transferError, useHinges } from './app/characterRig';
 import { reachFingertip } from './core/grasp/pin';
+import { graspQuality } from './core/grasp/quality';
 import { type ArmExport, type ArmMode, characterPoseJson, download, exportCharacterGlb, exportGlb, poseJson } from './app/exporter';
 import { type Engine, type EnginePackage, blenderPackage, godotPackage, unityPackage } from './app/packages';
 import { type HandPose, type RiggedHand, buildRiggedHand } from './app/handRig';
@@ -383,6 +384,25 @@ function settle(g: Grasp, rig: RiggedHand | undefined = hand?.rig): Grasp {
   }
   g.wrist.copy(result.wrist);
   g.angles = result.angles;
+  // the dots and the verdict are the drawn skin's own: the solver's came from its spheres, before the hand was moved out of the part
+  g.contacts = guard.contacts(result.wrist, result.angles);
+  const fingers = g.contacts.filter((c) => c.finger >= 0);
+  g.fingersTouching = new Set(fingers.map((c) => c.finger)).size;
+  g.palmTouching = g.contacts.some((c) => c.finger < 0);
+  g.thumbTouching = g.contacts.some((c) => c.finger >= 0 && rig.model.fingers[c.finger].isThumb);
+  g.segmentsTouching = new Set(fingers.map((c) => c.finger * 8 + c.link)).size;
+  if (!supportGrasps) {
+    const q = graspQuality(g.contacts, {
+      friction: ui.friction,
+      gravity: new Vector3(0, -1, 0),
+      com: object.grasp.com,
+      lever: Math.min(Math.max(object.grasp.radius, 0.1 * rig.model.size), 0.6 * rig.model.size),
+      mode: ui.mode,
+    });
+    g.stable = q.stable && q.effort <= 12;
+    g.effort = q.effort;
+    g.robustness = q.robustness;
+  }
   settledFrom.set(g, { key, wrist: from.wrist, angles: from.angles, result });
   return g;
 }
