@@ -25,7 +25,7 @@ const REGION_COLOUR: Record<number, [number, number, number]> = {
   [Region.HandL]: [100, 175, 235],
 };
 const ITEM_COLOURS: [number, number, number][] = [[90, 200, 120], [215, 205, 90], [200, 120, 210], [120, 210, 210]];
-/** Skin inside something it should not be in is painted this colour. */
+/** Skin inside something it should not be in, torn or folded, is painted this colour. */
 export const MARK: [number, number, number] = [255, 40, 40];
 
 export interface SheetScene {
@@ -53,6 +53,17 @@ function drawables(scene: SheetScene, skipHead: boolean): Drawable[] {
   });
   scene.items.forEach((it, k) => {
     for (const p of it.pieces) out.push({ positions: p.positions, index: p.index, colour: ITEM_COLOURS[k % ITEM_COLOURS.length], matrix: it.matrix });
+  });
+  // faults last and on top, so skin sunk in the chest or an item is seen through what covers it
+  body.skin.forEach((part, pi) => {
+    const m = scene.marks?.[pi];
+    if (!m) return;
+    const keep: number[] = [];
+    for (let t = 0; t + 2 < part.index.length; t += 3) {
+      const [a, b, c] = [part.index[t], part.index[t + 1], part.index[t + 2]];
+      if ((m[a] || m[b] || m[c]) && !(skipHead && part.region[a] === Region.Head)) keep.push(a, b, c);
+    }
+    if (keep.length) out.push({ positions: skin[pi], index: Uint32Array.from(keep), colour: MARK, onTop: true });
   });
   return out;
 }
@@ -83,7 +94,7 @@ export function views(body: Body, items: HeldItem[]): Record<ViewName, View> {
   const { centre, half } = focus(body, items);
   const far = 3;
   const head = body.head ? worldPos(body.head) : centre.clone().addScaledVector(up, 0.4);
-  // the eye: in front of the head bone, a little above it, looking ahead and down to where the hands work
+  // the eye: in front of the head bone, a little above it
   const eye = head.clone().addScaledVector(up, 0.08).addScaledVector(forward, 0.1);
   return {
     front: { name: 'front', eye: centre.clone().addScaledVector(forward, far), target: centre, up, half },
@@ -92,7 +103,8 @@ export function views(body: Body, items: HeldItem[]): Record<ViewName, View> {
     // shoulder blades and the backs of the arms, where a raised arm stretches the skin
     back: { name: 'back', eye: centre.clone().addScaledVector(forward, -far), target: centre, up, half },
     above: { name: 'above', eye: centre.clone().addScaledVector(up, far), target: centre, up: forward, half },
-    eye: { name: 'eye', eye, target: eye.clone().addScaledVector(forward, 1).addScaledVector(up, -0.35), up, fov: 75 },
+    // from the eye to what the hands are doing, wherever that is: an aimed gun ahead, a reload low in front of the chest
+    eye: { name: 'eye', eye, target: centre.clone().sub(eye).dot(forward) > 0.05 ? centre : eye.clone().addScaledVector(forward, 1).addScaledVector(up, -0.35), up, fov: 75 },
   };
 }
 

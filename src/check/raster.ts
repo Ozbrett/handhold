@@ -14,6 +14,8 @@ export interface Drawable {
   colours?: Uint8Array;
   /** Its own space to world; world when left out. */
   matrix?: Matrix4;
+  /** Drawn through whatever is in front of it: a fault buried inside the body still shows. */
+  onTop?: boolean;
 }
 
 export interface View {
@@ -84,7 +86,7 @@ export function render(items: Drawable[], view: View, width: number, height: num
         if (w0 < 0 || w1 < 0 || w2 < 0) continue;
         const z = w0 * sz[a] + w1 * sz[b] + w2 * sz[c];
         const o = y * width + x;
-        if (z >= depth[o]) continue;
+        if (!d.onTop && z >= depth[o]) continue;
         depth[o] = z;
         pic.rgb[o * 3] = r; pic.rgb[o * 3 + 1] = g; pic.rgb[o * 3 + 2] = bl;
       }

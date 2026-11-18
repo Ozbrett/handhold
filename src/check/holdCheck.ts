@@ -3,9 +3,10 @@ import { join } from 'node:path';
 import { Vector3 } from 'three';
 import { type Body, type FingerName, type Side, buildBody, posedSkin } from './body';
 import { type HeldItem, depthInItem } from './items';
+import { sampleCharacter } from '../app/samples';
 import { loadCharacter } from './load';
 import { encodePng } from './png';
-import { type Check, type GripSpec, checkPose, skinChecks } from './poseCheck';
+import { type Check, type GripSpec, checkPose, overlapChecks, skinChecks } from './poseCheck';
 import type { PoseFile } from './poseFile';
 import { type Review, fingerprint, record } from './review';
 import { type ItemSpec, aimFor, holdOn, loadItem } from './scene';
@@ -35,7 +36,8 @@ const bodies = new Map<string, Body>();
 export async function bodyFor(path: string): Promise<Body> {
   let b = bodies.get(path);
   if (!b) {
-    const found = buildBody(await loadCharacter(path));
+    // 'sample' is the site's built-in player, as on handhold.mjs's --hand
+    const found = buildBody(path === 'sample' ? sampleCharacter() : await loadCharacter(path));
     if (!found) throw new Error(`${path}: no arm with a hand and fingers found`);
     b = found;
     bodies.set(path, b);
@@ -43,8 +45,8 @@ export async function bodyFor(path: string): Promise<Body> {
   return b;
 }
 
-/** Skin inside the items (deeper than `limit` metres), torn or folded, per part and vertex, to paint on the sheet. */
-export function marksInside(body: Body, items: HeldItem[], limit = 0.002): Uint8Array[] {
+/** Skin inside the items (deeper than `limit` metres), inside another part of the body, torn or folded: per part and vertex, to paint on the sheet. */
+export function faultMarks(body: Body, items: HeldItem[], limit = 0.002): Uint8Array[] {
   const skin = posedSkin(body);
   const p = new Vector3();
   const marks = body.skin.map((s, pi) => {
@@ -60,6 +62,7 @@ export function marksInside(body: Body, items: HeldItem[], limit = 0.002): Uint8
     return m;
   });
   skinChecks(body, skin, marks);
+  overlapChecks(body, skin, [], marks);
   return marks;
 }
 
@@ -81,7 +84,7 @@ export async function checkHold(spec: HoldSpec, outDir: string, review: Review):
   const bad = checks.filter((c) => !c.pass).length;
   const dir = join(outDir, spec.name);
   mkdirSync(dir, { recursive: true });
-  const row = poseRow({ body, items: [item], marks: marksInside(body, [item]) }, 300, { caption: spec.name, warn: bad ? `${bad} FAIL` : undefined });
+  const row = poseRow({ body, items: [item], marks: faultMarks(body, [item]) }, 300, { caption: spec.name, warn: bad ? `${bad} FAIL` : undefined });
   const sheet = join(dir, 'sheet.png');
   writeFileSync(sheet, encodePng(stack([row])));
   const inputs = [spec.character, spec.item.obj, ...spec.hands.map((h) => readFileSync(h.pose, 'utf8'))];

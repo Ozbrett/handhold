@@ -197,13 +197,18 @@ export function jointChecks(body: Body, limb: Limb): Check[] {
 
 // ---------------------------------------------------------------------------------------------------------------- skin
 
-/** Skin at a joint: an edge stretched this many times its rest length tears; a triangle this small or turned over is pinched; a ring this much nearer its joint has collapsed. */
-export const SKIN = { stretch: 1.8, area: 0.2, ring: 0.7 };
+/**
+ * Skin at a joint: an edge stretched this many times its rest length tears; a triangle this small (a share of its rest area) is
+ * pinched, and one folded over is always pinched; a ring this much nearer its joint has collapsed. The area allowed differs by
+ * joint: the inside of a bent elbow and the front of the armpit squash in every rig and in life, a wrist does not.
+ */
+export const SKIN = { stretch: 1.8, area: { wrist: 0.2, elbow: 0.1, shoulder: 0.05 }, ring: 0.7 };
 /** A fold: neighbours whose faces agreed this well at rest (cosine) and now disagree this much. */
 const FOLD = { rest: 0.5, now: -0.5 };
 
 interface JointZone {
   id: string;
+  joint: 'wrist' | 'elbow' | 'shoulder';
   about: string;
   /** Two regions the joint's skin lies between. */
   a: Region;
@@ -216,9 +221,9 @@ function zones(body: Body): JointZone[] {
   for (const s of SIDES) {
     const l = body.limbs[s];
     if (!l) continue;
-    out.push({ id: `${s}.skin.wrist`, about: `${s} wrist skin`, a: armRegion(s, 'fore'), b: armRegion(s, 'hand'), pivot: l.hand });
-    out.push({ id: `${s}.skin.elbow`, about: `${s} elbow skin`, a: armRegion(s, 'upper'), b: armRegion(s, 'fore'), pivot: l.fore });
-    out.push({ id: `${s}.skin.shoulder`, about: `${s} shoulder skin`, a: Region.Torso, b: armRegion(s, 'upper'), pivot: l.upper });
+    out.push({ id: `${s}.skin.wrist`, joint: 'wrist', about: `${s} wrist skin`, a: armRegion(s, 'fore'), b: armRegion(s, 'hand'), pivot: l.hand });
+    out.push({ id: `${s}.skin.elbow`, joint: 'elbow', about: `${s} elbow skin`, a: armRegion(s, 'upper'), b: armRegion(s, 'fore'), pivot: l.fore });
+    out.push({ id: `${s}.skin.shoulder`, joint: 'shoulder', about: `${s} shoulder skin`, a: Region.Torso, b: armRegion(s, 'upper'), pivot: l.upper });
   }
   return out;
 }
@@ -265,7 +270,7 @@ export function skinChecks(body: Body, skin: Float32Array[], marks?: Uint8Array[
         const s0 = n0.length();
         if (s0 < 1e-9) continue;
         area = Math.min(area, n1.length() / s0);
-        if (marks && n1.length() / s0 < SKIN.area) marks[pi][i] = marks[pi][j] = marks[pi][k] = 1;
+        if (marks && n1.length() / s0 < SKIN.area[z.joint]) marks[pi][i] = marks[pi][j] = marks[pi][k] = 1;
         tris.push(t);
         nr.push(n0.clone().normalize());
         np.push(n1.clone().normalize());
@@ -287,7 +292,7 @@ export function skinChecks(body: Body, skin: Float32Array[], marks?: Uint8Array[
     });
     if (!ringN) continue;
     out.push(check(`${z.id}.tear`, `${z.about}: stretched`, stretch, 'x', SKIN.stretch));
-    out.push(check(`${z.id}.pinch`, `${z.about}: pinched or folded over`, area === Infinity ? 1 : area, 'x', SKIN.area, false));
+    out.push(check(`${z.id}.pinch`, `${z.about}: pinched or folded over`, area === Infinity ? 1 : area, 'x', SKIN.area[z.joint], false));
     out.push(check(`${z.id}.collapse`, `${z.about}: fallen in on the joint`, ringNow / Math.max(1e-9, ringRest), 'x', SKIN.ring, false));
   }
   return out;
@@ -394,6 +399,7 @@ export interface PosedVolume {
   w: Vector3;
   ru: number;
   rw: number;
+  bone: Bone;
 }
 
 /** The rods where the bones are now, or at rest. */
@@ -408,7 +414,7 @@ export function posedVolumes(body: Body, pose: 'now' | 'rest'): Map<Region, Pose
     const a = head.clone().lerp(tail, v.t0), b = head.clone().lerp(tail, v.t1);
     let list = out.get(v.region);
     if (!list) out.set(v.region, (list = []));
-    list.push({ a, b, u: v.u.clone().applyQuaternion(turn), w: v.w.clone().applyQuaternion(turn), ru: v.ru, rw: v.rw });
+    list.push({ a, b, u: v.u.clone().applyQuaternion(turn), w: v.w.clone().applyQuaternion(turn), ru: v.ru, rw: v.rw, bone: v.bone });
   }
   return out;
 }
@@ -455,7 +461,10 @@ function bodyPairs(body: Body): [Region, Region, string][] {
 }
 
 function bodyDepths(body: Body, skin: Float32Array[], rods: Map<Region, PosedVolume[]>, from: Region, into: Region): { depth: Float32Array; part: number[]; vert: number[] } {
-  const target = rods.get(into);
+  // an upper arm hangs from its own collarbone, and the top of the shoulder slides over it as the arm swings (the rig's collarbone
+  // stays still where a body's would shrug): the arm is measured against the rest of the chest, which it must never enter
+  const own = SIDES.map((s) => body.limbs[s]).find((l) => l && into === Region.Torso && armRegion(l.side, 'upper') === from)?.clavicle;
+  const target = rods.get(into)?.filter((r) => r.bone !== own);
   const part: number[] = [], vert: number[] = [];
   const depth: number[] = [];
   const p = new Vector3();
@@ -475,9 +484,10 @@ function bodyDepths(body: Body, skin: Float32Array[], rods: Map<Region, PosedVol
 /**
  * Nothing inside anything: the skin in each held item and each item's corners and edges in the skin; hand in hand, forearm in upper
  * arm, arms in the chest and head, arm in the other arm (measured from how far each was already in at rest, so a rest pose with the
- * arms pressed to the sides is not counted against a pose); item in item, except items declared to mate.
+ * arms pressed to the sides is not counted against a pose); item in item, except items declared to mate. `marks`, when given (one
+ * array per skin part), gets a 1 on every vertex of one body part sunk into another, for the sheet.
  */
-export function overlapChecks(body: Body, skin: Float32Array[], items: HeldItem[]): Check[] {
+export function overlapChecks(body: Body, skin: Float32Array[], items: HeldItem[], marks?: Uint8Array[]): Check[] {
   const out: Check[] = [];
   const rods = posedVolumes(body, 'now');
 
@@ -493,7 +503,11 @@ export function overlapChecks(body: Body, skin: Float32Array[], items: HeldItem[
     const now = bodyDepths(body, skin, rods, a, b);
     const was = rest.get(`${a}-${b}`)!;
     let worst = 0;
-    for (let i = 0; i < now.depth.length; i++) worst = Math.max(worst, now.depth[i] - (was[i] ?? 0));
+    for (let i = 0; i < now.depth.length; i++) {
+      const d = now.depth[i] - (was[i] ?? 0);
+      worst = Math.max(worst, d);
+      if (marks && d * 1000 > DEPTH.bodyOnBody) marks[now.part[i]][now.vert[i]] = 1;
+    }
     out.push(check(`body.${REGION_NAMES[a].replace(/\W+/g, '')}.in.${REGION_NAMES[b].replace(/\W+/g, '')}`, about, worst * 1000, 'mm', DEPTH.bodyOnBody));
   }
 

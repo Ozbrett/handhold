@@ -57,15 +57,17 @@ export const AIM = { ahead: 0.42, below: 0.035 };
 
 /** How far short of a straight arm a hand's place must be, as a share of the arm's length: an aimed arm keeps some bend. */
 export const AIM_BEND = 0.95;
+/** How near its shoulder a hand's place may be, as a share of the arm's length: nearer, the forearm folds into the chest. */
+export const AIM_FOLD = 0.6;
 
 /**
  * Where an aimed item can be held by this body: the distance ahead of the eye nearest `AIM.ahead` at which every hand's place on
- * the item lies within its arm's reach and the item is clear of the head and chest. A pistol sits at arm's length; a rifle comes
+ * the item lies within its arm's reach, neither past it nor folded in on the chest, and the item is clear of the head and chest. A pistol sits at arm's length; a rifle comes
  * back until the support hand reaches its handguard, the way a shouldered rifle sits. When no distance does both, the item kept
  * out of the body counts first (a hand short of its place shows as a reach failure; a gun through the face hides everything
  * else), then the hands least short.
  */
-export function aimFor(body: Body, item: HeldItem, hands: HandOn[]): Matrix4 {
+export function aimFor(body: Body, item: HeldItem, hands: HandOn[], below = AIM.below): Matrix4 {
   restPose(body);
   const rods = posedVolumes(body, 'rest');
   const body3 = [rods.get(Region.Head), rods.get(Region.Torso)];
@@ -73,7 +75,7 @@ export function aimFor(body: Body, item: HeldItem, hands: HandOn[]): Matrix4 {
   let best: { m: Matrix4; short: number; off: number } | null = null;
   for (let cm = 10; cm <= 60; cm++) {
     const ahead = cm / 100;
-    const m = aimedMatrix(body, item, 0, ahead);
+    const m = aimedMatrix(body, item, 0, ahead, below);
     let short = 0;
     for (const h of hands) {
       const arm = armOf(body, h.side);
@@ -82,7 +84,7 @@ export function aimFor(body: Body, item: HeldItem, hands: HandOn[]): Matrix4 {
       const wrist = new Vector3().setFromMatrixPosition(m.clone().multiply(inItem));
       const { min, max } = reachOf(arm);
       const d = wrist.distanceTo(arm.shoulder);
-      short += Math.max(0, d - max * AIM_BEND) + Math.max(0, min - d);
+      short += Math.max(0, d - max * AIM_BEND) + Math.max(0, Math.max(min, max * AIM_FOLD) - d);
     }
     let inside = 0;
     for (let i = 0; i < item.samples.length; i += 3) {
@@ -103,7 +105,7 @@ export function eyeOf(body: Body) {
 }
 
 /** A gun aimed straight ahead from the eye: its top up, its muzzle along the body's facing, its sight line just under the eye. */
-export function aimedMatrix(body: Body, item: HeldItem, sideOffset = 0, ahead = AIM.ahead): Matrix4 {
+export function aimedMatrix(body: Body, item: HeldItem, sideOffset = 0, ahead = AIM.ahead, below = AIM.below): Matrix4 {
   const { eye, forward, up } = eyeOf(body);
   const right = new Vector3().crossVectors(forward, up).normalize();
   // the item's own forward and up onto the body's
@@ -112,7 +114,7 @@ export function aimedMatrix(body: Body, item: HeldItem, sideOffset = 0, ahead = 
   const q = new Quaternion().setFromRotationMatrix(to.multiply(from.invert()));
   // the top of the gun is the sight line: put the top at the eye's height less `below`
   const top = item.max.y;
-  const at = eye.clone().addScaledVector(forward, ahead).addScaledVector(up, -AIM.below - top).addScaledVector(right, sideOffset);
+  const at = eye.clone().addScaledVector(forward, ahead).addScaledVector(up, -below - top).addScaledVector(right, sideOffset);
   return new Matrix4().compose(at, q, new Vector3(1, 1, 1));
 }
 
