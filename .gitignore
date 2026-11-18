@@ -9,3 +9,4 @@ handhold.local.json
 !.claude/skills/
 handhold-out/
 .claude/skills/*/local-*.md
+__pycache__/

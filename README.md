@@ -109,6 +109,14 @@ A grip is only as good as the wrist it is on. [Rig Doctor](docs/rig-doctor.md) c
 node scripts/rig-doctor.mjs fix character.blend --save character_fixed.blend --shots out/wrists
 ```
 
+Before any of that, [Rig Check](docs/rig-check.md) says whether a model will animate at all without warping: its skeleton against
+a default rig, every weight, and every joint turned as far as animation turns it while the skin is measured (thickness kept,
+edges torn, skin dragged or left behind). It fixes what can be fixed in the weights, for people and creatures alike:
+
+```bash
+node scripts/rig-check.mjs check creature.fbx --report creature.rigcheck.json
+```
+
 ## Limits
 
 Handhold needs open hands with separate fingers: fists, mittens and fused fingers are not rigged. It is built around the palm, so it does not find precision pinches such as holding a pen. Arm posing needs a plain upper arm, forearm and hand chain.

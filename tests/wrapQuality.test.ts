@@ -23,4 +23,9 @@ describe('a hand wrapped round a bar', () => {
       expect(q.effort).toBeLessThan(6);
     });
   }
+  it('does not hold a bar touched on one side only', () => {
+    // a quarter of the way round: nothing pushes back against the fingers, so the bar slides out of the hand
+    const q = graspQuality(wrap(0.02, [0, 0.02], 6, 0.25), opt);
+    expect(q.stable).toBe(false);
+  });
 });
