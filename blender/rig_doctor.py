@@ -33,6 +33,9 @@ fix only (each one is a step; with none named, all of them run)
   --blend                hand mesh: the part inside the sleeve blends from forearm to hand over --blend-len metres (0.06), so
                          a turn is spread along the wrist instead of folding at one ring
   --seams                points that sit together (UV splits, the sleeve's rim on the glove) get one shared set of weights
+  --twist                (only when named) a twist bone halfway down each forearm, a leaf under it, and the forearm's weights
+                         handed to it more and more towards the wrist; the game turns it by --twist-share (0.5) of the hand's
+                         roll, so a roll is spread along the forearm instead of wringing the wrist. The wrist roll test turns it too
   (always, last)         every vertex is kept to its 4 strongest bones, as a game skins it
   --save <file.blend>    save the fixed scene (everything in it, animations too)
   --export <file>        also export it (.fbx or .glb); FBX keeps the scene's actions, with no leaf bones
@@ -43,6 +46,7 @@ left to fix, 1 on an error. The JSON has every number and a list of plain-words 
 import json
 import math
 import os
+import re
 import shlex
 import sys
 
@@ -63,6 +67,7 @@ if not ARGS or ARGS[0] not in ('check', 'fix'):
     sys.exit(1)
 CMD = ARGS[0]
 FLAGS = {'trim', 'scraps', 'cuff', 'blend', 'seams'}
+OPT_IN = {'twist'}    # steps that change the skeleton run only when named: a game has to drive a new bone
 OPT = {}
 i = 1
 while i < len(ARGS):
@@ -70,7 +75,7 @@ while i < len(ARGS):
     if not a.startswith('--'):
         sys.exit(f'[rig_doctor] unexpected "{a}"')
     k = a[2:]
-    if k in FLAGS:
+    if k in FLAGS or k in OPT_IN:
         OPT[k] = True
         i += 1
     else:
@@ -88,6 +93,7 @@ PINCH = 0.75          # thickness kept at the wrist under a turn below which it 
 MAX_INFLUENCES = 4    # bones a vertex may follow in a game
 SEAM_GAP = 0.3       # weights of two touching points differ by more than this (summed): the seam opens
 CUFF_WEIGHT = 0.05    # a sleeve vertex with more hand weight than this follows the hand
+TWIST_SHARE = float(OPT.get('twist-share', 0.5))
 SIDES = {'both': 'lr', 'l': 'l', 'r': 'r'}[OPT.get('side', 'both')]
 
 
@@ -147,6 +153,12 @@ def real_parent(b):
     while p is not None and (p.head_local - b.head_local).length < 1e-5:
         p = p.parent
     return p
+
+
+def twist_name(fore):
+    """The twist bone's name beside its forearm's: lowerarm_l -> lowerarm_twist_01_l, mixamorig:LeftForeArm -> mixamorig:LeftForeArmTwist."""
+    m = re.match(r'^(.*?)([_.](?:l|r|L|R|left|right))$', fore)
+    return f'{m.group(1)}_twist_01{m.group(2)}' if m else fore + 'Twist'
 
 
 def subtree(b):
@@ -233,6 +245,13 @@ class Arm:
             reach = max(0.12, sum((mw @ c.tail_local - mw @ c.head_local).length for c in [self.hand]) * 2.0)
         self.reach = reach
         self.fore_len = (self.wrist - self.elbow).length
+        self.twist = next((c.name for c in self.fore.children if 'twist' in norm(c.name) and c.name not in self.hand_bones), None)
+        self.names = (self.hand.name, self.fore.name, self.upper.name)
+
+    def refresh(self, arm):
+        """Bone references die when the armature goes through edit mode: look them up again by name."""
+        bones = arm.data.bones
+        self.hand, self.fore, self.upper = (bones[n] for n in self.names)
 
     def frame(self, co):
         """Distance along the forearm past the wrist (t) and from the forearm's line (r), for world positions."""
@@ -328,6 +347,7 @@ def check(arm, meshes, hand_names, arms):
         rep['cuff_verts'] = cuff
         rep['cuff_weight_sum'] = round(cuff_sum, 2)
         rep['scraps'] = scraps
+        rep['twist_bone'] = A.twist
         rep['wrist'] = wrist_test(arm, meshes, A, data)
         out['arms'].append(rep)
         f = out['findings']
@@ -367,6 +387,7 @@ TESTS = {
 def wrist_test(arm, meshes, A, data):
     """Turns the hand bone and measures the ring of skin at the wrist: how thick it stays, and the worst edge stretch."""
     pb = arm.pose.bones[A.hand.name]
+    tb = arm.pose.bones[A.twist] if A.twist else None
     rings = {}
     edges = {}
     for o in meshes:
@@ -383,6 +404,10 @@ def wrist_test(arm, meshes, A, data):
     for name, (axis, deg) in TESTS.items():
         v = Vector((1, 0, 0)) if axis == 'X' else Vector((0, 1, 0)) if axis == 'Y' else Vector((0, 0, 1))
         pb.rotation_quaternion = Quaternion(v, math.radians(deg))
+        if tb is not None and axis == 'Y':
+            # as the game drives it: the twist bone (its Y also runs down the forearm) takes its share of the hand's roll, and the
+            # hand, a child of the forearm and not of the twist bone, keeps its own
+            tb.rotation_quaternion = Quaternion(v, math.radians(deg * TWIST_SHARE))
         bpy.context.view_layer.update()
         kept, stretch = [], 1.0
         # the forearm does not move in this test, so its line still measures the thickness
@@ -406,6 +431,8 @@ def wrist_test(arm, meshes, A, data):
                     stretch = max(stretch, float(ratio.max()), float(1.0 / max(ratio.min(), 1e-3)))
         res[name] = {'thickness_kept': round(min(kept) if kept else 1.0, 3), 'worst_edge_stretch': round(stretch, 2)}
         pb.rotation_quaternion = (1, 0, 0, 0)
+        if tb is not None:
+            tb.rotation_quaternion = (1, 0, 0, 0)
     bpy.context.view_layer.update()
     return res
 
@@ -558,6 +585,8 @@ def fix(arm, meshes, hand_names, arms, steps):
                     changed += 1
             if changed:
                 done.append(f'{o.name}: wrist blended from forearm to hand ({changed} vertices)')
+    if 'twist' in steps:
+        done.extend(add_twist_bones(arm, meshes, arms))
     if 'seams' in steps:
         n = weld_seam_weights(meshes)
         if n:
@@ -567,6 +596,63 @@ def fix(arm, meshes, hand_names, arms, steps):
     n = limit_influences(meshes)
     if n:
         done.append(f'{n} vertices kept to their {MAX_INFLUENCES} strongest bones')
+    return done
+
+
+def add_twist_bones(arm, meshes, arms):
+    """
+    A twist bone from halfway down each forearm to the wrist, parented to the forearm and with nothing under it, and the
+    forearm's weights handed to it from nothing just below the elbow to all of them at the wrist. At rest it changes nothing (it
+    sits on the forearm's line with the forearm's own axes); turned about its length it carries the far end of the forearm round
+    with the hand, so a roll is spread from the elbow to the wrist the way a real forearm's two bones spread it.
+    """
+    done = []
+    pose_rest(arm)
+    want = [A for A in arms if not A.twist]
+    if want:
+        for o in bpy.context.view_layer.objects:
+            o.select_set(False)
+        bpy.context.view_layer.objects.active = arm
+        arm.select_set(True)
+        bpy.ops.object.mode_set(mode='EDIT')
+        eb = arm.data.edit_bones
+        for A in want:
+            fore = eb[A.names[1]]
+            wrist = eb[A.names[0]].head.copy()
+            b = eb.new(twist_name(A.names[1]))
+            b.head = fore.head.lerp(wrist, 0.5)
+            b.tail = wrist
+            b.align_roll(fore.z_axis)
+            b.parent = fore
+            b.use_connect = False
+            b.use_deform = True
+            A.twist = b.name
+        bpy.ops.object.mode_set(mode='OBJECT')
+        for A in arms:
+            A.refresh(arm)
+        done.append('twist bones added: ' + ', '.join(A.twist for A in want))
+    for o in meshes:
+        co = world_rest(o)
+        ws = weights_of(o)
+        changed = 0
+        for A in arms:
+            t, _ = A.frame(co)
+            for k, w in enumerate(ws):
+                f = w.get(A.fore.name, 0.0)
+                if f <= 1e-4:
+                    continue
+                along = 1.0 + float(t[k]) / A.fore_len          # 0 at the elbow, 1 at the wrist
+                give = smoothstep(0.15, 0.95, along)
+                if give <= 1e-4:
+                    continue
+                nw = dict(w)
+                nw[A.fore.name] = f * (1.0 - give)
+                nw[A.twist] = nw.get(A.twist, 0.0) + f * give
+                set_weights(o, k, nw)
+                ws[k] = nw
+                changed += 1
+        if changed:
+            done.append(f'{o.name}: forearm weights spread onto the twist bones ({changed} vertices)')
     return done
 
 
@@ -767,7 +853,7 @@ def main():
 
     report = {'command': CMD}
     if CMD == 'fix':
-        steps = {s for s in FLAGS if OPT.get(s)} or set(FLAGS)
+        steps = {s for s in FLAGS | OPT_IN if OPT.get(s)} or set(FLAGS)
         report['before'] = check(arm, meshes, hand_names, arms)
         report['done'] = fix(arm, meshes, hand_names, arms, steps)
         for d in report['done']:
