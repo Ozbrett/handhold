@@ -7,7 +7,7 @@
  * anywhere, prove it will animate, and fix its weights without a window.
  *
  *   node scripts/rig-check.mjs check <model> [--report <file.json>] [--kind auto|humanoid|creature] [--quick] [--ranges <file.json>]
- *   node scripts/rig-check.mjs fix   <model> [--unweighted] [--far] [--spikes] [--orphans] [--save <out.blend>] [--export <out.fbx|.glb>]
+ *   node scripts/rig-check.mjs fix   <model> [--unweighted] [--far] [--spikes] [--orphans] [--leaks] [--limbs] [--smooth] [--save <out.blend>] [--export <out.fbx|.glb>]
  *
  *   node scripts/rig-check.mjs selftest      (Rig Check's own test: a built body and each fault put into it; npm run test:blender)
  *
@@ -56,7 +56,7 @@ for (let i = 0; i < rest.length; i++) {
   const a = rest[i];
   args.push(a);
   if (pathOpts.has(a) && i + 1 < rest.length) args.push(resolve(rest[++i]));
-  else if (a.startsWith('--') && i + 1 < rest.length && !rest[i + 1].startsWith('--') && !['--unweighted', '--far', '--spikes', '--orphans', '--quick'].includes(a)) args.push(rest[++i]);
+  else if (a.startsWith('--') && i + 1 < rest.length && !rest[i + 1].startsWith('--') && !['--unweighted', '--far', '--spikes', '--orphans', '--leaks', '--limbs', '--smooth', '--quick'].includes(a)) args.push(rest[++i]);
 }
 const quoted = args.map((a) => `"${a.replace(/\\/g, '/').replace(/"/g, '\\"')}"`).join(' ');
 const blender = findBlender();

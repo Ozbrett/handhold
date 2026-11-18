@@ -13,7 +13,7 @@ node scripts/rig-check.mjs check <model> [--report <file.json>] [--ranges <file.
 ```
 
 ```bash
-node scripts/rig-check.mjs fix <model> [--unweighted] [--far] [--spikes] [--orphans] [--save <fixed.blend>] [--export <fixed.fbx|.glb>]
+node scripts/rig-check.mjs fix <model> [--unweighted] [--far] [--spikes] [--orphans] [--leaks] [--limbs] [--smooth] [--save <fixed.blend>] [--export <fixed.fbx|.glb>]
 ```
 
 `<model>` is a `.fbx`, `.glb`, `.gltf` or `.blend`. Blender is found at `$BLENDER`, or the newest one in the usual install folder.
@@ -42,7 +42,7 @@ a person's shape.
 | influences | a vertex follows more than 4 bones (Unity, three.js and glTF skin with 4) |
 | far | a vertex is weighted to a bone below its own, or on another branch, that is far from it (a warning when the far bone is above its own: a big body riding its root) |
 | spikes | a vertex's weights are nothing like its neighbours' |
-| mirror weights | a humanoid's left side is weighted unlike its right, where the mesh itself is mirrored |
+| mirror weights | a humanoid's left side is weighted unlike its right, where the mesh itself is mirrored (mirrored about the skeleton's middle bones: a pouch or holster on one side moves the skin's own middle) |
 | sum, orphans | weights not adding to 1, groups named for no bone (warnings) |
 
 ## Every joint turned
@@ -57,6 +57,7 @@ are turned 60, 40 and 20. A game that knows its own ranges passes them:
 ```
 
 Each key is a pattern on the bone name, each value the bend, side and roll in degrees; the first pattern that matches a bone wins.
+A joint the game never turns is `[0, 0, 0]`: it is not turned, and not failed for sitting outside the skin.
 For each turn it measures:
 
 | Measure | Fails when |
@@ -73,10 +74,18 @@ With no step named, `fix` runs all of them, then checks everything again and rep
 | Step | What it does |
 |---|---|
 | `--unweighted` | a vertex that follows no bone follows its nearest bone |
-| `--far` | the weights the far check fails are taken off and the rest renormalised |
+| `--far` | every weight on a bone far from the vertex, however small, is taken off (not on a bone above its own) and the rest renormalised: a small one left would grow past the check's share |
 | `--spikes` | a spike's weights become its neighbours' average (twice) |
 | `--orphans` | vertex groups named for no bone are removed |
+| `--leaks` | a joint that drags skin far from it: its weight, and its children's, is faded out of that skin and given to the bones near it that do not turn with it |
+| `--limbs` | a joint that leaves skin on its limb behind: that skin's weight on bones outside the limb is faded over to the limb's own bones |
+| `--smooth` | a joint that tears: the weights round it are averaged until the blend is about 0.6 of the limb's radius wide each side |
 | always, last | every vertex is kept to its 4 strongest bones and its weights add to 1 |
+
+`--leaks`, `--limbs` and `--smooth` work from the joints the check before them failed. Every averaging keeps each vertex to the
+bones it already follows and the bones near it, or it would carry weight out to skin far from a bone, which `--far` then takes off
+again. One run may not mend everything (a step that mends one check can fail another): run `fix` again on its saved scene, and keep
+the round that passes most.
 
 `--save x.blend` keeps the fixed scene, animations too; `--export x.fbx|x.glb` also exports it (FBX with its actions and no leaf
 bones). What cannot be fixed in the weights (a joint outside the skin, a skeleton that is not mirrored, a missing bone) is
@@ -91,8 +100,9 @@ npm run test:blender
 builds a humanoid of tubes with sound weights, which must pass every check, then puts each fault into a copy of it and expects
 the check that is for it to catch it (and `fix` to mend it, where it mends that fault): rigid weights tear, unweighted, far and
 spiked vertices, five bones on a vertex, an elbow out in the air, a forearm that does not point at its hand, a missing neck, an
-arm 12 cm out of mirror, forearm skin on the spine, a wrist on an open seam, the same body under Mixamo, Blender and Rigify names,
-and a creature with no names at all.
+arm 12 cm out of mirror, forearm skin on the spine, a wrist on an open seam, the neck leaking to the belly, a coarse limb smoothed
+wide, a pouch on one hip, a model of two meshes, the same body under Mixamo, Blender and Rigify names, and a creature with no names
+at all.
 
 ## With Rig Doctor and Handhold
 

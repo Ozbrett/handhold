@@ -212,6 +212,72 @@ expect('rigid weights, turned 5 degrees', rep, 'stress_stretch', 'pass')
 if any(r['range'] != [5.0, 5.0, 5.0] for r in rep['joints']):
     failures.append('ranges: a joint was not turned by the given range')
 
+# a hard step at every joint, smoothed: the blend is widened round each joint that tears, and nothing else starts failing
+arm, body = build(rigid=True)
+rep = run(arm, body)
+done = rc.fix(rc.Model(arm, [body]), {'smooth': True}, rep['joints'])
+rep = run(arm, body)
+print('[test_rig_check]   rigid, smoothed (' + str(done.get('smooth')) + ' vertices): ' + ', '.join(f'{r["bone"]} p99 {r["stretch_p99"]:.2f} max {r["stretch_max"]:.2f}' for r in rep['joints'][:6]), flush=True)
+expect('rigid weights, smoothed', rep, 'stress_stretch', ('pass', 'warn'))
+for k in ('far', 'spikes', 'stress_kept', 'stress_drag', 'stress_lag'):
+    expect('rigid weights, smoothed', rep, k, 'pass')
+
+# a long coarse limb of three bones with a hard step at its first joint, and a joint radius as wide as the limb (a mound): the
+# averaging reaches far down it, and must not carry the first bone's weight out to skin far from that bone
+def coarse_limb():
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    ad = bpy.data.armatures.new('limb')
+    arm = bpy.data.objects.new('limb', ad)
+    bpy.context.scene.collection.objects.link(arm)
+    bpy.context.view_layer.objects.active = arm
+    bpy.ops.object.mode_set(mode='EDIT')
+    prev = None
+    for k in range(3):
+        b = ad.edit_bones.new(f'bone_{k}')
+        b.head, b.tail = Vector((k, 0, 0)), Vector((k + 1, 0, 0))
+        if prev:
+            b.parent, b.use_connect = prev, True
+        prev = b
+    bpy.ops.object.mode_set(mode='OBJECT')
+    v, f, arc, _ = tube_mesh([(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], [0.05] * 4, step=0.15)
+    me = bpy.data.meshes.new('limb')
+    me.from_pydata([tuple(p) for p in v], [], f)
+    body = bpy.data.objects.new('limb', me)
+    bpy.context.scene.collection.objects.link(body)
+    g = [body.vertex_groups.new(name=f'bone_{k}') for k in range(3)]
+    for i, s in enumerate(arc):
+        g[min(2, int(s))].add([i], 1.0, 'REPLACE')
+    body.modifiers.new('arm', 'ARMATURE').object = arm
+    body.parent = arm
+    bpy.context.view_layer.update()
+    return arm, body
+
+
+arm, body = coarse_limb()
+expect('a coarse limb', run(arm, body), 'far', 'pass')
+rc.fix(rc.Model(arm, [body]), {'smooth': True}, [{'bone': 'bone_1', 'radius_cm': 100.0, 'stretch_p99': 5.0, 'stretch_max': 9.0}])
+expect('a coarse limb, smoothed wide', run(arm, body), 'far', 'pass')
+
+# the neck's weight leaking down to the belly: the belly moves when the neck turns. --leaks alone (not --far) fades it out of the
+# belly and gives it back to the bones the belly follows, with no step left behind
+arm, body = build()
+co = np.array([tuple(v.co) for v in body.data.vertices])
+rings = np.hypot(co[:, 0], co[:, 1])
+for i in range(len(co)):
+    dz = abs(co[i][2] - 1.0)
+    if dz < 0.1 and abs(rings[i] - 0.14) < 0.012:
+        f = 0.45 * (1 - dz / 0.1) ** 2
+        w = {g.group: g.weight for g in body.data.vertices[i].groups}
+        names = {g.index: g.name for g in body.vertex_groups}
+        set_w(body, i, {**{names[k]: x * (1 - f) for k, x in w.items()}, 'neck': f})
+rep = run(arm, body)
+expect('neck leaking to the belly', rep, 'stress_drag', 'fail')
+done = rc.fix(rc.Model(arm, [body]), {'leaks': True}, rep['joints'])
+rep = run(arm, body)
+print(f'[test_rig_check]   leaks fixed on {done.get("leaks")} vertices', flush=True)
+for k in ('stress_drag', 'stress_stretch', 'stress_lag', 'spikes'):
+    expect('neck leaking to the belly, fixed', rep, k, 'pass')
+
 # vertices that follow no bone
 arm, body = build()
 for i in near(body, (0.6, 0, 1.45), 10):
@@ -232,6 +298,14 @@ rep = run(arm, body)
 expect('far weights, fixed', rep, 'far', 'pass')
 expect('far weights, fixed', rep, 'stress_drag', 'pass')
 
+# ... and with a little on the calf as well (under the far check's share): taking the thigh off must not leave the calf's share
+# grown into a far weight of its own
+arm, body = build()
+for i in near(body, (0.62, 0, 1.4), 40):
+    set_w(body, i, {'lowerarm_l': 0.2, 'thigh_l': 0.72, 'calf_l': 0.08})
+rc.fix(rc.Model(arm, [body]), {'far': True})
+expect('far weights and a little more, fixed', run(arm, body), 'far', 'pass')
+
 # forearm skin weighted half to the spine, a bone above it: not dragged anywhere, but left behind when the arm turns
 arm, body = build()
 for i in near(body, (0.62, 0, 1.4), 40):
@@ -239,6 +313,12 @@ for i in near(body, (0.62, 0, 1.4), 40):
 rep = run(arm, body)
 expect('forearm on the spine', rep, 'far', 'warn')
 expect('forearm on the spine', rep, 'stress_lag', 'fail')
+# ... handed to the forearm's own bones by --limbs, with no tear left at the edge of what was handed over
+rc.fix(rc.Model(arm, [body]), {'limbs': True}, rep['joints'])
+rep = run(arm, body)
+expect('forearm on the spine, fixed', rep, 'stress_lag', 'pass')
+expect('forearm on the spine, fixed', rep, 'stress_stretch', ('pass', 'warn'))
+expect('forearm on the spine, fixed', rep, 'far', 'pass')
 
 # single vertices on the upper arm weighted to the hand: spikes
 arm, body = build()
@@ -268,6 +348,26 @@ for i in near(body, (0.6, 0, 1.45), 10):
 rc.fix(rc.Model(arm, [body]), {'unweighted': True})
 expect('unweighted, fixed', run(arm, body), 'unweighted', 'pass')
 
+# a bone that holds no skin (a socket, a prop's handle) beside the forearm: unweighted forearm skin is given to the forearm, the
+# nearest bone that holds skin, not to the socket (which hangs off the spine and would leave it behind when the elbow turns)
+arm, body = build()
+bpy.context.view_layer.objects.active = arm
+bpy.ops.object.mode_set(mode='EDIT')
+sk = arm.data.edit_bones.new('socket_1')
+sk.head, sk.tail = Vector((0.56, -0.06, 1.4)), Vector((0.68, -0.06, 1.4))
+sk.parent = arm.data.edit_bones['spine']
+bpy.ops.object.mode_set(mode='OBJECT')
+for i in near(body, (0.62, 0, 1.4), 60):
+    set_w(body, i, {})
+rc.fix(rc.Model(arm, [body]), {'unweighted': True})
+g = body.vertex_groups.get('socket_1')
+on_socket = sum(1 for v in body.data.vertices for x in v.groups if g is not None and x.group == g.index and x.weight > 0)
+line = f'{"ok  " if on_socket == 0 else "FAIL"} unweighted beside a socket, fixed: {on_socket} vertices on the socket (want 0)'
+print('[test_rig_check] ' + line, flush=True)
+if on_socket:
+    failures.append(line)
+expect('unweighted beside a socket, fixed', run(arm, body), 'stress_stretch', ('pass', 'warn'))
+
 # an elbow out in the air beside the arm
 arm, body = build()
 bpy.context.view_layer.objects.active = arm
@@ -275,6 +375,8 @@ bpy.ops.object.mode_set(mode='EDIT')
 arm.data.edit_bones['lowerarm_l'].head = Vector((0.5, 0.0, 1.62))
 bpy.ops.object.mode_set(mode='OBJECT')
 expect('elbow outside', run(arm, body), 'joints', 'fail')
+# ... a joint the game never turns bends no skin, wherever it sits
+expect('elbow outside, never turned', run(arm, body, ranges={'^lowerarm_l$': [0, 0, 0]}), 'joints', 'pass')
 
 # a sleeve ending short of the glove: the skin cut away 1.5 cm either side of the left wrist. Covered on both sides, so a gap to
 # close (a warning), not a joint out in the air, and the wrist is still turned
@@ -334,6 +436,51 @@ for label, names in NAMINGS.items():
         print(f'[test_rig_check] FAIL {label} names: read as {rep["kind"]}, roles {sorted(rep["roles"])}', flush=True)
     expect(f'{label} names', rep, 'roles', 'pass')
     expect(f'{label} names', rep, 'mirror_weights', 'pass')
+
+# a pouch on the right hip: the skin's median moves off the body's middle, and the left must still be compared with the right
+def with_pouch(rigid=False):
+    arm, body = build(rigid=rigid)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32, radius=0.06, location=(-0.2, -0.1, 1.0))
+    pouch = bpy.context.active_object
+    pouch.vertex_groups.new(name='hips').add(list(range(len(pouch.data.vertices))), 1.0, 'REPLACE')
+    pouch.modifiers.new('arm', 'ARMATURE').object = arm
+    bpy.context.view_layer.update()
+    return arm, body, pouch
+
+
+arm, body, pouch = with_pouch()
+_, rep = rc.run_checks(arm, [body, pouch], {'in': 'test'})
+expect('a pouch on one side', rep, 'mirror_weights', 'pass')
+if 'not compared' in next(c['value'] for c in rep['weights'] if c['key'] == 'mirror_weights'):
+    failures.append('a pouch on one side: the sides were not compared')
+    print('[test_rig_check] FAIL a pouch on one side: the sides were not compared', flush=True)
+# ... and with the left weighted unlike the right, that is caught
+arm, body, pouch = with_pouch()
+for v in body.data.vertices:
+    if v.co.x > 0.04:
+        set_w(body, v.index, {'spine': 1.0})
+_, rep = rc.run_checks(arm, [body, pouch], {'in': 'test'})
+expect('a pouch on one side, the left weighted unlike the right', rep, 'mirror_weights', 'fail')
+
+# a model of two meshes is fixed mesh by mesh, each from the same joints
+arm, body, pouch = with_pouch(rigid=True)
+_, rep = rc.run_checks(arm, [body, pouch], {'in': 'test'})
+try:
+    rc.fix(rc.Model(arm, [body, pouch]), {}, rep['joints'])
+    _, rep = rc.run_checks(arm, [body, pouch], {'in': 'test'})
+    expect('two meshes, fixed', rep, 'stress_stretch', ('pass', 'warn'))
+except Exception as e:
+    failures.append(f'two meshes, fixed: {e!r}')
+    print(f'[test_rig_check] FAIL two meshes, fixed: {e!r}', flush=True)
+
+# a vertex whose neighbours are all on a bone far from it keeps its own weights when they are averaged, not the far bone
+S = np.array([[0.0, 1.0], [0.5, 0.5]])
+ok = np.array([[True, False], [True, True]])
+got = rc.held_to(S, ok, np.array([[1.0, 0.0], [0.0, 1.0]]))
+line = f'held to near bones: {got.tolist()} (want [[1, 0], [0.5, 0.5]])'
+print('[test_rig_check] ' + ('ok   ' if np.allclose(got, [[1, 0], [0.5, 0.5]]) else 'FAIL ') + line, flush=True)
+if not np.allclose(got, [[1, 0], [0.5, 0.5]]):
+    failures.append(line)
 
 # a creature: no humanoid names, still checked for weights and stress
 arm, body = build(names={n: f'bone_{i}' for i, n in enumerate(BONES)})

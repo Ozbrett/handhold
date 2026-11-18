@@ -14,7 +14,8 @@ What is checked (each a pass, warn or fail with the measurement and the fix):
               lengths    each humanoid limb bone is in a person's range of the body's height, and the left matches the right
               mirror     the left joints mirror the right ones across the body's middle
               aim        every bone with one child points at it (IK and a twist turn about the line it points along)
-              joints     every joint that bends skin sits inside the skin, near the middle of the limb (rays from the joint out);
+              joints     every joint that bends skin sits inside the skin, near the middle of the limb (rays from the joint out; a
+                         joint --ranges turns by 0 bends none and is not checked);
                          one on an open seam between two pieces (a sleeve ending short of a glove) is a warning
   weights     unweighted a vertex that follows no bone stays behind when the body moves: the mesh tears
               sum        weights that do not add to 1 (engines differ in what they do with the rest)
@@ -42,9 +43,15 @@ Options
 
 fix only (each a step; with none named, all of them run), then everything is checked again
   --unweighted           a vertex that follows no bone follows its nearest bone
-  --far                  weights on bones far from the vertex are taken off and the rest renormalised
+  --far                  weights on bones far from the vertex (not above its own bone) are taken off and the rest renormalised
   --spikes               a spike's weights become its neighbours' average (twice)
   --orphans              vertex groups named for no bone are removed
+  --leaks                a joint whose turn drags skin far from it: its weight is faded out of that skin and given to the bones
+                         near it that do not turn with it
+  --limbs                a joint whose turn leaves skin on its limb behind: the weight that skin has on bones outside the limb is
+                         faded over to the limb's own bones
+  --smooth               a joint whose turn tears the skin (a hard step in the weights): the weights round it are averaged until the
+                         blend is about 0.6 of the limb's radius wide each side
   (always, last)         every vertex is kept to its 4 strongest bones and its weights add to 1
   --save <file.blend>    save the fixed scene
   --export <file>        also export it (.fbx or .glb); FBX keeps the scene's actions, with no leaf bones
@@ -64,7 +71,7 @@ from mathutils import Quaternion, Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-FIX_STEPS = ('unweighted', 'far', 'spikes', 'orphans')
+FIX_STEPS = ('unweighted', 'far', 'spikes', 'orphans', 'leaks', 'limbs', 'smooth')
 
 # a person's limb lengths as a share of their height (bone head to its child's head), wide enough for a stylised character
 LENGTHS = {'upperarm': (0.11, 0.24), 'lowerarm': (0.09, 0.22), 'thigh': (0.16, 0.32), 'calf': (0.15, 0.32)}
@@ -283,6 +290,11 @@ class Model:
             self.co[o.name] = world_co(o, False)
             self.edges[o.name] = edges_of(o)
             self.read_weights(o)
+        # bones that hold skin: a bone with none (a socket, a prop's handle, an end bone) is no vertex's nearest bone
+        held = np.zeros(len(self.bone_names), bool)
+        for o in meshes:
+            held |= (self.W[o.name] > 0).any(0)
+        self.holds = held if held.any() else np.ones(len(self.bone_names), bool)
         allco = np.concatenate([self.co[o.name] for o in meshes])
         lo, hi = allco.min(0), allco.max(0)
         self.height = float(hi[2] - lo[2])
@@ -316,9 +328,11 @@ class Model:
         self.W[o.name], self.counts[o.name], self.sums[o.name], self.orphans[o.name] = W, counts, sums, orph
 
     def seg_dist(self, co, idx=None):
-        """Distance from each point to each deform bone's segment (N x B), or to the bones idx only."""
+        """Distance from each point to each deform bone's segment (N x B), or to the bones idx only; infinite to a bone that holds
+        no skin."""
         h = self.head if idx is None else self.head[idx]
         t = self.tail if idx is None else self.tail[idx]
+        holds = self.holds if idx is None else self.holds[idx]
         ab = t - h
         L2 = np.maximum((ab * ab).sum(1), 1e-12)
         out = np.empty((len(co), len(h)), np.float32)
@@ -326,6 +340,7 @@ class Model:
             p = co[k:k + 8192, None, :] - h[None]
             s = np.clip((p * ab[None]).sum(2) / L2[None], 0, 1)
             out[k:k + 8192] = np.linalg.norm(p - s[..., None] * ab[None], axis=2)
+        out[:, ~holds] = np.inf
         return out
 
     def nearest(self, o):
@@ -399,7 +414,9 @@ def joint_radius(M, b):
     return {'inside': True, 'hits': len(best), 'radius': radius, 'off': off / max(radius, 1e-6)}
 
 
-def skeleton_checks(M, kind, roles):
+def skeleton_checks(M, kind, roles, ranges=None):
+    """ranges: each bone's turn range; a joint turned by none (0, 0, 0) bends no skin, so where it sits is not checked."""
+    ranges = ranges or {}
     out = []
     arm = M.arm
     mw = arm.matrix_world
@@ -475,7 +492,7 @@ def skeleton_checks(M, kind, roles):
     radii, outside, offc, gaps = {}, [], [], []
     for b in M.deform:
         par = real_parent(b)
-        if par is None or SKIP_RE.search(b.name):
+        if par is None or SKIP_RE.search(b.name) or tuple(ranges.get(b.name, (1,))) == (0, 0, 0):
             continue
         j = M.bidx[b.name]
         heavy = sum(int((M.W[o.name][:, j] > 0.2).sum()) for o in M.meshes)
@@ -516,14 +533,33 @@ def neighbours_mean(W, edges, n):
     return acc / np.maximum(deg, 1)[:, None], deg
 
 
-def far_mask(M, o):
-    """(vertex, bone) pairs weighted FAR_SHARE or more to a bone FAR_BY of the size farther away than the nearest bone."""
-    W = M.W[o.name]
+def far_bones(M, o):
+    """(vertex, bone) pairs where the bone is FAR_BY of the size farther away than the vertex's nearest bone, and at least FAR_RATIO
+    times as far: skin on a big body is far from every bone, and its weight on the root beside the chest is sound."""
     d = M.seg_dist(M.co[o.name])
     near = d.min(1)
-    # and at least twice as far as the nearest bone: skin on a big body is far from every bone, and its weight on the root beside the
-    # chest is sound
-    return (W >= FAR_SHARE) & (d - near[:, None] > FAR_BY * M.size) & (d > FAR_RATIO * near[:, None])
+    return (d - near[:, None] > FAR_BY * M.size) & (d > FAR_RATIO * near[:, None])
+
+
+def far_mask(M, o):
+    """(vertex, bone) pairs weighted FAR_SHARE or more to a far bone."""
+    return (M.W[o.name] >= FAR_SHARE) & far_bones(M, o)
+
+
+def may_follow(M, o):
+    """(vertex, bone) pairs a fix may give weight to: the bones the vertex already follows (a body riding its root keeps its root),
+    and the bones not far from it. Averaging weights over the mesh is held to these, or it carries a bone's weight out to skin far
+    from it, which the far check then fails and its fix takes off again, leaving the step the averaging was for."""
+    return (M.W[o.name] > 0) | (~far_bones(M, o) & M.holds[None, :])
+
+
+def held_to(S, ok, before):
+    """Weight rows with the weight on bones a vertex may not follow dropped, adding to what they added to; a row left with none is
+    the vertex's weights before (its neighbours are all on bones far from it)."""
+    tot = S.sum(1, keepdims=True)
+    K = S * ok
+    k = K.sum(1, keepdims=True)
+    return np.where(k > 1e-9, K * tot / np.maximum(k, 1e-9), before)
 
 
 def ancestor_matrix(M):
@@ -597,8 +633,11 @@ def weight_mirror(M):
     worst, matched, differ = 0.0, 0, 0
     allco = np.concatenate([M.co[o.name] for o in M.meshes])
     allW = np.concatenate([M.W[o.name] for o in M.meshes])
-    # the mirror plane: half way along x (the body is imported standing with its sides along x)
-    mid = float(np.median(allco[:, 0]))
+    # the mirror plane is the skeleton's middle along x (the body is imported standing with its sides along x): the heads of the
+    # bones with no other side. The skin's own median is not: a pouch, a holster or a sleeve on one side moves it off the middle,
+    # and every point is then compared with a point beside its true twin
+    centre = [i for i in range(len(M.bone_names)) if swap[i] == i]
+    mid = float(np.median(M.head[centre, 0])) if centre and len(centre) < len(M.bone_names) else float(np.median(allco[:, 0]))
     kd = KDTree(len(allco))
     for i, p in enumerate(allco):
         kd.insert(p, i)
@@ -784,14 +823,14 @@ def stress_checks(rows):
     st = 'fail' if wm['stretch_max'] > STRETCH_MAX_FAIL or w['stretch_p99'] > STRETCH_P99_FAIL else 'warn' if w['stretch_p99'] > STRETCH_P99_WARN else 'pass'
     check(out, st, 'stress_stretch', 'No edge tears or stretches when a joint turns',
           f'99% of edges within {w["stretch_p99"]:.2f}x ({w["bone"]}); the worst 0.1% {wm["stretch_max"]:.2f}x ({wm["bone"]})',
-          'A hard step in the weights at the joint: smooth it (rig-check fix --spikes, then Weights > Smooth on that joint).')
+          'A hard step in the weights at the joint: rig-check fix --smooth widens the blend round it (Blender: Weights > Smooth on that joint).')
     w = worst('dragged')
     check(out, 'fail' if w['dragged'] > 20 else 'warn' if w['dragged'] else 'pass', 'stress_drag', 'Skin far from a joint stays put when it turns',
           f'{w["dragged"]} vertices dragged at worst ({w["bone"]})', 'Take that bone\'s weight off skin far from it (rig-check fix --far).')
     w = worst('left_behind')
     check(out, 'fail' if w['left_behind'] > 20 else 'warn' if w['left_behind'] else 'pass', 'stress_lag',
           'Skin out on a limb goes round with it', f'{w["left_behind"]} vertices left behind at worst ({w["bone"]})',
-          'That skin is weighted to a bone above the limb: give it to the limb\'s own bones (paint it, or rig-check fix --far).')
+          'That skin is weighted to a bone outside the limb: give it to the limb\'s own bones (rig-check fix --limbs, or paint it).')
     return out
 
 
@@ -813,15 +852,141 @@ def write_weights(o, M, rows):
                 g.add([i], w, 'REPLACE')
 
 
-def fix(M, opt):
+def smoothstep(e0, e1, x):
+    t = np.clip((x - e0) / (e1 - e0), 0.0, 1.0)
+    return t * t * (3 - 2 * t)
+
+
+def stop_leaks(M, o, W, rows):
+    """Skin far from a joint that moves when it turns (the drag the stress pass fails): that joint's weight, and its children's, is
+    faded out of the skin from 0.6 to 1 of the distance the drag check measures from (none is left where it counts a vertex dragged),
+    and given to the bones the vertex follows that do not turn with the joint (its nearest such bone when it follows none). Only joints that fail drag. Returns the vertices changed."""
+    changed = np.zeros(len(W), bool)
+    co = M.co[o.name]
+    for row in rows:
+        if row.get('dragged', 0) <= 20 or row['bone'] not in M.bidx:
+            continue
+        b = M.arm.data.bones[row['bone']]
+        r = row['radius_cm'] / 100
+        moved = M.subtree(b)
+        rest = [j for j in range(len(M.bone_names)) if j not in set(moved)]
+        if not moved or not rest:
+            continue
+        reach = max(DRAG_FROM * r, 0.1 * M.size)
+        dsub = M.seg_dist(co, moved).min(1)
+        keep = 1.0 - smoothstep(0.6 * reach, reach, dsub)
+        on = W[:, moved].sum(1)
+        hit = (keep < 1.0) & (on > 0)
+        if not hit.any():
+            continue
+        idx = np.where(hit)[0]
+        taken = W[np.ix_(idx, moved)].sum(1) * (1.0 - keep[idx])
+        W[np.ix_(idx, moved)] *= keep[idx][:, None]
+        # to the bones the vertex already follows that are near it (not twice as far as its nearest), in their shares: they change
+        # smoothly across the skin, and a far one would only leak in turn. A vertex that follows none near it takes its nearest bone
+        D = M.seg_dist(co[idx], rest)
+        nearby = D <= FAR_RATIO * D.min(1, keepdims=True)
+        R = W[np.ix_(idx, rest)] * nearby
+        others = R.sum(1)
+        has = others > 1e-6
+        add = np.where(has[:, None], R / np.maximum(others, 1e-9)[:, None] * taken[:, None], 0.0)
+        W[np.ix_(idx, rest)] += add
+        lone = np.where(~has)[0]
+        if len(lone):
+            W[idx[lone], np.array(rest)[D[lone].argmin(1)]] += taken[lone]
+        changed[idx] = True
+    return changed
+
+
+def follow_limbs(M, o, W, rows):
+    """Skin out on a limb that stays behind when the limb's joint turns (the lag the stress pass fails): skin nearest the limb's
+    bones and within its thickness of them, weighted to bones outside the limb. That weight is handed to the limb's bones (in the
+    shares the vertex already has on them, else to its nearest), fully from 3 joint radii out and 1.5 radii of the limb's bones,
+    fading to none at 2 radii out and 2.5 of the bones, so no step is left. Only joints that fail lag. Returns the vertices changed."""
+    changed = np.zeros(len(W), bool)
+    co = M.co[o.name]
+    nearest = M.nearest(o)
+    for row in rows:
+        if row.get('left_behind', 0) <= 20 or row['bone'] not in M.bidx:
+            continue
+        b = M.arm.data.bones[row['bone']]
+        r = row['radius_cm'] / 100
+        moved = M.subtree(b)
+        rest = [j for j in range(len(M.bone_names)) if j not in set(moved)]
+        if not moved or not rest:
+            continue
+        head = np.array(tuple(M.arm.matrix_world @ b.head_local))
+        dh = np.linalg.norm(co - head, axis=1)
+        D = M.seg_dist(co, moved)
+        g = smoothstep(2 * r, 3 * r, dh) * (1.0 - smoothstep(1.5 * r, 2.5 * r, D.min(1))) * np.isin(nearest, moved)
+        out = W[:, rest].sum(1)
+        hit = (g > 1e-4) & (out > 0)
+        if not hit.any():
+            continue
+        idx = np.where(hit)[0]
+        taken = out[idx] * g[idx]
+        W[np.ix_(idx, rest)] *= (1.0 - g[idx])[:, None]
+        own = W[np.ix_(idx, moved)]
+        tot = own.sum(1)
+        has = tot > 1e-6
+        W[np.ix_(idx, moved)] += np.where(has[:, None], own / np.maximum(tot, 1e-9)[:, None] * taken[:, None], 0.0)
+        lone = np.where(~has)[0]
+        if len(lone):
+            W[idx[lone], np.array(moved)[D[idx[lone]].argmin(1)]] += taken[lone]
+        changed[idx] = True
+    return changed
+
+
+def smooth_joints(M, o, W, rows):
+    """A hard step in the weights at a joint (the stretch the stress pass fails): the weights round it are averaged over the mesh's
+    edges until the blend is about 0.6 of the limb's radius wide each side, fully within 2 radii of the joint and fading out by 3,
+    each vertex keeping to the bones it may follow (may_follow). Only joints that fail stretch. Returns the vertices changed."""
+    changed = np.zeros(len(W), bool)
+    co = M.co[o.name]
+    e = M.edges[o.name]
+    if not len(e):
+        return changed
+    elen = np.linalg.norm(co[e[:, 0]] - co[e[:, 1]], axis=1)
+    ok = may_follow(M, o)
+    for row in rows:
+        if row['bone'] not in M.bidx or not (row.get('stretch_p99', 0) > STRETCH_P99_FAIL or row.get('stretch_max', 0) > STRETCH_MAX_FAIL):
+            continue
+        b = M.arm.data.bones[row['bone']]
+        r = row['radius_cm'] / 100
+        head = np.array(tuple(M.arm.matrix_world @ b.head_local))
+        dh = np.linalg.norm(co - head, axis=1)
+        region = dh < 3 * r
+        if region.sum() < 4:
+            continue
+        inner = region[e[:, 0]] & region[e[:, 1]]
+        step = float(np.median(elen[inner])) if inner.any() else float(np.median(elen))
+        rounds = int(np.clip(np.ceil(0.75 * (r / max(step, 1e-6)) ** 2), 4, 100))
+        S = W.copy()
+        for _ in range(rounds):
+            tot = S.sum(1, keepdims=True)
+            avg, deg = neighbours_mean(S / np.maximum(tot, 1e-9), e, len(S))
+            mix = region & (deg > 0)
+            S[mix] = held_to(0.5 * S[mix] / np.maximum(tot[mix], 1e-9) + 0.5 * avg[mix], ok[mix], S[mix])
+        g = (1.0 - smoothstep(2 * r, 3 * r, dh))[:, None]
+        idx = np.where(region)[0]
+        W[idx] = g[idx] * S[idx] + (1 - g[idx]) * W[idx]
+        changed |= region
+    return changed
+
+
+def fix(M, opt, rows=None):
+    """rows: the stress pass's joints (the report's 'joints'), which the leaks, limbs and smooth steps work from; without them those steps
+    do nothing."""
     steps = {s for s in FIX_STEPS if opt.get(s)} or set(FIX_STEPS)
     done = {}
+    rows = rows or []
     for o in M.meshes:
         W = M.W[o.name]
         changed = np.zeros(len(W), bool)
         if 'far' in steps:
-            # only the weights the far check fails: on a bone above the vertex's own they are a body riding its root
-            m = far_mask(M, o)
+            # every weight on a far bone, however small: one left behind grows past the far check's share when the rest is
+            # normalised. Not on a bone above the vertex's own: that is a body riding its root
+            m = (W > 0) & far_bones(M, o)
             if m.any():
                 m &= ~ancestor_matrix(M)[M.seg_dist(M.co[o.name]).argmin(1)]
             W[m] = 0
@@ -842,10 +1007,22 @@ def fix(M, opt):
                     break
                 tot = W.sum(1, keepdims=True)
                 avg, _ = neighbours_mean(W / np.maximum(tot, 1e-9), M.edges[o.name], len(W))
-                W[s] = avg[s]
+                W[s] = held_to(avg[s], may_follow(M, o)[s], W[s])
                 changed |= s
                 n += int(s.sum())
             done['spikes'] = done.get('spikes', 0) + n
+        if 'leaks' in steps:
+            c = stop_leaks(M, o, W, rows)
+            changed |= c
+            done['leaks'] = done.get('leaks', 0) + int(c.sum())
+        if 'limbs' in steps:
+            c = follow_limbs(M, o, W, rows)
+            changed |= c
+            done['limbs'] = done.get('limbs', 0) + int(c.sum())
+        if 'smooth' in steps:
+            c = smooth_joints(M, o, W, rows)
+            changed |= c
+            done['smooth'] = done.get('smooth', 0) + int(c.sum())
         # always: the 4 strongest, adding to 1
         over = (W > 0).sum(1) > 4
         if over.any():
@@ -860,9 +1037,9 @@ def fix(M, opt):
         off = (np.abs(tot - 1) > 1e-4) & (tot > 0)
         W[off] /= tot[off][:, None]
         changed |= off
-        rows = np.where(changed)[0]
-        if len(rows):
-            write_weights(o, M, rows)
+        touched = np.where(changed)[0]
+        if len(touched):
+            write_weights(o, M, touched)
         if 'orphans' in steps:
             bones = set(M.arm.data.bones.keys())
             for g in list(o.vertex_groups):
@@ -885,10 +1062,11 @@ def run_checks(arm, meshes, opt):
     M = Model(arm, meshes)
     roles = find_roles(arm)
     kind = detect_kind(roles, opt.get('kind', 'auto'))
-    skel, radii = skeleton_checks(M, kind, roles)
+    ranges = joint_ranges(M, kind, roles, opt.get('ranges'))
+    skel, radii = skeleton_checks(M, kind, roles, ranges)
     weights = weight_checks(M, kind)
     joints = stress_joints(M, kind, roles, radii, bool(opt.get('quick')))
-    rows = stress(M, joints, radii, joint_ranges(M, kind, roles, opt.get('ranges')))
+    rows = stress(M, joints, radii, ranges)
     allc = skel + weights + stress_checks(rows)
     passed = not any(c['status'] == 'fail' for c in allc)
     return M, {
@@ -920,7 +1098,7 @@ def main():
     M, rep = run_checks(arm, meshes, opt)
     if opt['cmd'] == 'fix':
         before = rep
-        done = fix(M, opt)
+        done = fix(M, opt, rep['joints'])
         log('fixed: ' + (', '.join(f'{k} {v}' for k, v in done.items()) or 'nothing to fix'))
         M, rep = run_checks(arm, meshes, opt)
         rep['before'] = {'score': before['score'], 'pass': before['pass']}
