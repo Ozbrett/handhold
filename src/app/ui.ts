@@ -62,6 +62,9 @@ export interface PanelState {
   pinPicking: boolean;
   pinSet: boolean;
   pinMiss: number;
+  /** What keeping the hand's skin out of the item did to the selected grip, and whether it could not. */
+  skinNote: string;
+  skinWarn: boolean;
   /** The model has a second usable hand with an arm, so two-handed grips can be found. */
   twoHandsAvailable: boolean;
   twoHands: boolean;
@@ -758,6 +761,7 @@ export class Panel {
               ? `That finger cannot reach the spot from this grip: it stops ${Math.round(s.pinMiss * 100)}% of a hand length short. Try another grip, or mark the grip point nearer the spot.`
               : 'The fingertip is on the spot.',
         ),
+        s.skinNote ? h('p', { class: s.skinWarn ? 'warning' : 'note', key: 'skin' }, s.skinNote) : null,
         h(
           'div',
           { class: 'row' },

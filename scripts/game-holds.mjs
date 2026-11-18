@@ -3,7 +3,7 @@
  * session, and writes a pose file per hold plus summary.json. Nothing is opened on screen.
  *
  *   node scripts/game-holds.mjs --hand <character file> --in <folder with manifest.json> [--out folder]
- *        [--only pose,pose] [--frames 3,4] [--move 0.2] [--turn 15] [--skin-mm 5] [--shots] [--compare] [--eval js] [--build]
+ *        [--only pose,pose] [--frames 3,4] [--move 0.2] [--turn 15] [--skin-mm 1] [--shots] [--compare] [--eval js] [--build]
  *
  * The manifest (the game writes it, for example from an editor script); an optional top-level "hinges": "bone:ax,ay,az,maxDegrees,px,py,pz;..."
  * (each finger bone's one bending axis and rest position, in the game's rest space, mirrored like the rest) makes the fingers bend only about those
@@ -15,10 +15,11 @@
  * hand placement. With --move / --turn (a share of the hand's length, degrees; 0 keeps the hand exactly where the game put it) the
  * hand may also shift and turn that far when it then holds clearly better; where it ended up is written as "placeAfter" (same form as
  * "place") for the game to apply. An idle hold is solved on its grip hold's hand, so laying the trigger finger along the frame never
- * moves the hand. Every hold also reports "depth": how far the drawn hand's skin goes into the WHOLE held thing (every part of
- * the OBJ, not only the grip), per finger and the palm, in metres. A finger deeper than --skin-mm (5) is first taken out of it (its end
- * joints, knuckle or whole finger opened or closed, measured on the skin; "cleared" says what moved), and still deeper is listed as a
- * problem. The trigger finger is left where the game wants it. --shots: close-ups from both sides; --compare: the same views of the game's own hold (game_*.obj from the export).
+ * moves the hand. Every hold is settled the way the site settles every grip it shows: the drawn hand's skin is kept out of the
+ * WHOLE held thing (every part of the OBJ, not only the grip), both ways, its edges included, by turning finger joints within
+ * their limits and, where no joint can, moving the hand out and closing the fingers on it again ("cleared" says what moved, and
+ * the move is in "placeAfter"). "depth" is what is left, per finger and the palm, in metres; anything over --skin-mm (1) is a
+ * problem. The trigger finger stays where the game wants it unless it is in the part. --shots: close-ups from both sides; --compare: the same views of the game's own hold (game_*.obj from the export).
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -63,8 +64,8 @@ const browser = await chromium.launch({
 });
 const results = [];
 const problems = [];
-/** Glove skin deeper than this inside the held thing (mm) is a problem: a few mm is a glove pressed on a grip, more is a finger through the gun. */
-const SkinDepthMm = Number(args['skin-mm'] ?? 5);
+/** Skin deeper than this inside the held thing (mm), or the held thing this deep in the skin, is a problem: the site keeps both under 1 mm. */
+const SkinDepthMm = Number(args['skin-mm'] ?? 1);
 try {
   for (const side of ['right', 'left']) {
     const mine = items.filter((it) => it.side === side);
@@ -133,8 +134,8 @@ try {
           if (!g) return { error: 'no grip came back', placed: hh.placed };
           let triggerMiss = -1;
           if (trigger && index >= 0 && !hh.actions.pinAt(index, trigger)) triggerMiss = hh.ui.pinMiss * hh.hand.rig.model.size;
-          // the trigger finger (pinned to the trigger, or laid along the frame on an idle hold) is where the game wants it: leave it
-          const cleared = clearSkin(hh, g, (trigger || it.relax) && index >= 0 ? index : -1, it.skinTol);
+          // the site keeps the drawn skin out of the whole held thing (both ways, edges included), moving fingers or the hand
+          const skin = hh.skin();
           return {
             placed: hh.placed,
             stable: g.stable,
@@ -148,105 +149,14 @@ try {
             triggerMiss,
             after: hh.handAt(points.map((p) => p.name)),
             pose: hh.pose(),
-            depth: skinDepth(hh),
-            cleared,
+            depth: skin?.after ?? null,
+            depthBefore: skin?.before ?? null,
+            skinClear: skin?.clear ?? false,
+            skinMoved: skin?.moved ?? 0,
+            cleared: skin?.changes.join('; ') ?? '',
           };
-          /**
-           * Takes each finger whose drawn skin is deeper than tol in the held thing out of it (2026-11-18): its end joints, its knuckle or
-           * the whole finger opened or closed in tenths of the way to open or to its stop, measured on the skin each time, the shallowest
-           * kept. The solver keeps its collision spheres clear, but the skin over a thumb's root stood 14 to 20 mm past them into a gun.
-           */
-          function clearSkin(hh, g, leave, tol) {
-            const model = hh.hand.rig.model;
-            const keyOf = (name) => (name === 'pinky' ? 'little' : name);
-            const angles = Float32Array.from(g.angles);
-            const show = () => hh.viewer.setPose({ wrist: g.wrist, angles }, 0);
-            show();
-            const said = [];
-            model.fingers.forEach((f, fi) => {
-              if (fi === leave) return;
-              const key = keyOf(f.name);
-              const depthNow = () => skinDepth(hh)?.[key] ?? 0;
-              const start = depthNow();
-              if (start <= tol) return;
-              const dofs = f.joints.map((j) => {
-                const joint = model.joints[j];
-                const d = joint.dofs.findIndex((x) => x.kind === 'flex');
-                return d < 0 ? null : { at: joint.dofStart + d, dof: joint.dofs[d] };
-              });
-              const was = dofs.map((d) => (d ? angles[d.at] : 0));
-              const set = (way, share, mask) =>
-                dofs.forEach((d, k) => {
-                  if (!d) return;
-                  const to = (mask & (1 << k)) === 0 ? was[k] : way < 0 ? Math.max(d.dof.min, Math.min(d.dof.max, d.dof.open ?? 0)) : d.dof.max;
-                  angles[d.at] = was[k] + (to - was[k]) * share;
-                });
-              let best = { depth: start, way: 0, share: 0, mask: 7 };
-              for (let step = 1; step <= 10 && best.depth > tol; step++) {
-                for (const mask of [6, 1, 7]) {
-                  for (const way of [-1, 1]) {
-                    set(way, step / 10, mask);
-                    show();
-                    const d = depthNow();
-                    if (d < best.depth - 0.0005) best = { depth: d, way, share: step / 10, mask };
-                    if (best.depth <= tol) break;
-                  }
-                  if (best.depth <= tol) break;
-                }
-              }
-              set(best.way, best.share, best.mask);
-              show();
-              if (best.way) said.push(`${key} ${best.mask === 6 ? 'end joints ' : best.mask === 1 ? 'knuckle ' : ''}${best.way < 0 ? 'opened' : 'closed'} ${Math.round(best.share * 100)}%: ${(start * 1000).toFixed(1)} -> ${(best.depth * 1000).toFixed(1)} mm`);
-            });
-            g.angles.set(angles);
-            return said.join('; ');
-          }
-          /**
-           * How deep the drawn hand's own skin goes into the whole held thing, per finger and the palm (metres, 0 = outside), with the
-           * deepest point's place: the solver keeps its collision spheres clear, but a sphere is thinner than the glove over a knuckle,
-           * so a thumb could lie 10 mm inside a receiver with every sphere clear (the game measured it, 2026-11-18).
-           */
-          function skinDepth(hh) {
-            const root = hh.viewer.hand?.root;
-            if (!root || !hh.object?.grasp) return null;
-            root.updateMatrixWorld(true);
-            const V = root.position.constructor;
-            const v = new V();
-            const out = { thumb: 0, index: 0, middle: 0, ring: 0, little: 0, palm: 0 };
-            const where = {};
-            const finger = (name) => {
-              const n = name.toLowerCase();
-              if (n.includes('thumb')) return 'thumb';
-              if (n.includes('index')) return 'index';
-              if (n.includes('middle')) return 'middle';
-              if (n.includes('ring')) return 'ring';
-              if (n.includes('pinky') || n.includes('little')) return 'little';
-              return 'palm';
-            };
-            root.traverse((m) => {
-              const pos = m.geometry?.getAttribute?.('position');
-              if (!pos || !m.visible) return;
-              const si = m.isSkinnedMesh ? m.geometry.getAttribute('skinIndex') : null;
-              const sw = m.isSkinnedMesh ? m.geometry.getAttribute('skinWeight') : null;
-              const bones = m.isSkinnedMesh ? m.skeleton.bones : null;
-              for (let i = 0; i < pos.count; i++) {
-                m.getVertexPosition(i, v);
-                v.applyMatrix4(m.matrixWorld);
-                const d = -hh.object.grasp.distance(v.x, v.y, v.z);
-                if (!(d > 0)) continue;
-                let key = 'palm';
-                if (si && sw) {
-                  let best = 0, w = -1;
-                  for (let k = 0; k < 4; k++) if (sw.getComponent(i, k) > w) { w = sw.getComponent(i, k); best = si.getComponent(i, k); }
-                  key = finger(bones[best]?.name ?? '');
-                }
-                if (d > out[key]) { out[key] = d; where[key] = [v.x, v.y, v.z].map((x) => Math.round(x * 1e4) / 1e4); }
-              }
-            });
-            return { ...out, where };
-          }
         },
-        { obj, file: it.file, it: { ...it, skinTol: SkinDepthMm / 1000 }, adjust, trigger },
+        { obj, file: it.file, it, adjust, trigger },
       );
       const ms = Date.now() - t0;
       // --eval "<expression>": printed per hold, evaluated in the page after the solve (hh is window.__handhold), for checking by hand
@@ -268,9 +178,9 @@ try {
       const moved = Math.hypot(now[0] - was[0], now[1] - was[1], now[2] - was[2]);
       results.push({ ...strip(it0), ...stats, place: it0.place, placeAfter, moved: round(moved), poseFile });
       const fit = r.placed ? `fit ${(r.placed.rms * 1000).toFixed(1)} mm, scale ${r.placed.scale.toFixed(3)}` : 'no fit';
-      const deep = r.depth ? Object.entries(r.depth).filter(([k, d]) => k !== 'where' && d * 1000 > SkinDepthMm) : [];
-      if (deep.length) problems.push(`${tag}: skin inside the held thing: ${deep.map(([k, d]) => `${k} ${(d * 1000).toFixed(1)} mm`).join(', ')}`);
-      console.log(`  ${tag}: ${r.stable ? 'holds' : 'slips'}, squeeze ${r.squeeze}, ${r.segments}/${r.segmentsTotal} segments, thumb ${r.thumb}, palm ${r.palm}; ${fit}; hand moved ${(moved * 1000).toFixed(0)} mm${r.triggerMiss >= 0 ? `, trigger finger ${(r.triggerMiss * 1000).toFixed(0)} mm short` : ''} (${ms} ms)${r.cleared ? `; cleared ${r.cleared}` : ''}${r.depth ? `; skin in ${['thumb', 'index', 'middle', 'ring', 'little', 'palm'].map((k) => (r.depth[k] * 1000).toFixed(1)).join('/')} mm` : ''}`);
+      const deep = r.depth ? Object.entries(r.depth).filter(([, d]) => d * 1000 > SkinDepthMm) : [];
+      if (deep.length || !r.skinClear) problems.push(`${tag}: skin and the held thing in each other: ${deep.map(([k, d]) => `${k} ${(d * 1000).toFixed(1)} mm`).join(', ') || 'not cleared'}`);
+      console.log(`  ${tag}: ${r.stable ? 'holds' : 'slips'}, squeeze ${r.squeeze}, ${r.segments}/${r.segmentsTotal} segments, thumb ${r.thumb}, palm ${r.palm}; ${fit}; hand moved ${(moved * 1000).toFixed(0)} mm (${(r.skinMoved * 1000).toFixed(1)} of it out of the part)${r.triggerMiss >= 0 ? `, trigger finger ${(r.triggerMiss * 1000).toFixed(0)} mm short` : ''} (${ms} ms)${r.cleared ? `; cleared ${r.cleared}` : ''}${r.depth ? `; skin in ${['thumb', 'index', 'middle', 'ring', 'little', 'palm'].map((k) => (r.depth[k] * 1000).toFixed(1)).join('/')} mm` : ''}`);
       if (args.shots) {
         // close up on the hand, from either side of the held thing (its X axis runs across a gun); the view is kept in the held
         // thing's own axes so the game's own hold (--compare) is seen from exactly the same place

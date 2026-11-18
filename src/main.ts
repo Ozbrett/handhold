@@ -33,6 +33,7 @@ import {
   motionLoops,
 } from './app/animations';
 import { Viewer } from './app/viewer';
+import { type GuardResult, SkinGuard } from './app/skinGuard';
 import { type ArmBones, mainChild, turnWrist } from './app/skinCheck';
 
 interface HandEntry {
@@ -135,6 +136,8 @@ const ui: PanelState = {
   pinPicking: false,
   pinSet: false,
   pinMiss: 0,
+  skinNote: '',
+  skinWarn: false,
   twoHandsAvailable: false,
   twoHands: false,
   grip2: false,
@@ -326,6 +329,63 @@ let sweepTo: HoldPose | null = null;
 let sweepActive = false;
 // a fingertip pinned to a spot on the object (object space)
 let pin: { finger: number; point: Vector3 } | null = null;
+/** Each grip's hand as the solver left it, and the pin it was settled for (see settle). */
+const settledFrom = new WeakMap<Grasp, { key: string; wrist: Matrix4; angles: Float32Array; result: GuardResult }>();
+let guards: { rig: RiggedHand; object: GraspObject; guard: SkinGuard }[] = [];
+/** While the item is dragged in the hand, the hand only moves; it is settled again when let go. */
+let dragging = false;
+
+function guardFor(rig: RiggedHand, o: GraspObject): SkinGuard {
+  let e = guards.find((x) => x.rig === rig && x.object === o);
+  if (!e) {
+    e = { rig, object: o, guard: new SkinGuard(rig, o) };
+    guards = [e, ...guards].slice(0, 4);
+  }
+  return e.guard;
+}
+
+/**
+ * A grip as it is shown and exported: the pinned fingertip (if any) moved onto its spot, then the hand's own skin taken out of
+ * the item (SkinGuard). The solver keeps its collision spheres clear, but the skin over them reaches further, so without this a
+ * knuckle, a thumb's root or the heel of the palm could sit inside the item. The grip is changed in place, once per pin.
+ */
+function settle(g: Grasp, rig: RiggedHand | undefined = hand?.rig): Grasp {
+  if (!rig || !object || dragging) return g;
+  const main = rig === hand?.rig;
+  const key = main && pin ? `${pin.finger}:${pin.point.toArray().join(',')}` : '';
+  const was = settledFrom.get(g);
+  if (was && was.key === key) return g;
+  const from = was ?? { wrist: g.wrist.clone(), angles: g.angles.slice() };
+  let angles = from.angles;
+  const keep: number[] = [];
+  if (main && pin) {
+    const target = pin.point.clone().applyMatrix4(from.wrist.clone().invert());
+    const r = reachFingertip(rig.model, angles, pin.finger, target);
+    ui.pinMiss = r.miss / rig.model.size;
+    angles = r.angles;
+    keep.push(pin.finger);
+  }
+  // fingers laid along the item stay laid along it
+  if (main && placed?.relax.length) {
+    const relaxed = new Set(placed.relax.map((n) => n.toLowerCase()));
+    rig.model.fingers.forEach((f, i) => relaxed.has(f.name.toLowerCase()) && keep.push(i));
+  }
+  const result = guardFor(rig, object.grasp).clear(from.wrist, angles, { keep });
+  g.wrist.copy(result.wrist);
+  g.angles = result.angles;
+  settledFrom.set(g, { key, wrist: from.wrist, angles: from.angles, result });
+  return g;
+}
+
+/** What settling did to a grip, for the panel. */
+function skinNote(g: Grasp | undefined): { text: string; warn: boolean } {
+  const r = g && settledFrom.get(g)?.result;
+  if (!r) return { text: '', warn: false };
+  const mm = (m: number) => `${(m * 1000).toFixed(1)} mm`;
+  if (!r.clear) return { text: `This grip leaves skin ${mm(r.after.worst)} inside the item even with the hand moved out ${mm(r.moved)}. Pick another grip, or mark the grip point somewhere more open.`, warn: true };
+  if (r.before.worst <= 0.001) return { text: 'No skin inside the item.', warn: false };
+  return { text: `Skin kept out of the item (it was ${mm(r.before.worst)} in)${r.moved > 0 ? `: the hand moved out ${mm(r.moved)}` : ''}${r.changes.length > (r.moved > 0 ? 1 : 0) ? ', fingers turned to rest on it' : ''}.`, warn: false };
+}
 // two-handed grips: the character's other hand, its grip point, and its grip for each entry in `grasps`
 interface SupportEntry {
   name: string;
@@ -408,13 +468,9 @@ function rebuildHand() {
   sync();
 }
 
-/** The grip's joint angles, with the pinned fingertip (if any) moved onto its spot. */
+/** The grip's joint angles as shown: settled (the pinned fingertip on its spot, the skin out of the item). */
 function anglesOf(g: Grasp): Float32Array {
-  if (!pin || !hand) return g.angles;
-  const target = pin.point.clone().applyMatrix4(g.wrist.clone().invert());
-  const r = reachFingertip(hand.rig.model, g.angles, pin.finger, target);
-  ui.pinMiss = r.miss / hand.rig.model.size;
-  return r.angles;
+  return settle(g).angles;
 }
 
 /** The Arm step's position, or the point along its sweep being looked at. */
@@ -1067,8 +1123,11 @@ function setObject(source: Object3D, name: string, presetGrip?: { point: Vector3
 function selectGrasp(index: number, ms = 420) {
   if (!grasps || !grasps[index] || !hand) return;
   ui.selected = index;
-  const g = grasps[index];
-  viewer.setPose({ wrist: g.wrist, angles: anglesOf(g) }, ms);
+  const g = settle(grasps[index]);
+  const note = skinNote(g);
+  ui.skinNote = note.text;
+  ui.skinWarn = note.warn;
+  viewer.setPose({ wrist: g.wrist, angles: g.angles }, ms);
   const second = supportGrasps?.[index];
   viewer.setContacts(second ? [...g.contacts, ...second.contacts] : g.contacts);
   if (characterView) applyCharacterView(false);
@@ -1123,6 +1182,22 @@ async function findGrips() {
       armOn = true;
       hold ??= defaultHold(hand.arm!);
     }
+  }
+  // every grip is shown with the hand's skin out of the item; one that cannot be got out is not offered while others can
+  const out: number[] = [];
+  for (let i = 0; i < found.length; i++) {
+    settle(found[i]);
+    const second = supportGrasps?.[i];
+    if (second && support) settle(second, support.rig);
+    const clear = settledFrom.get(found[i])?.result.clear !== false && (!second || settledFrom.get(second)?.result.clear !== false);
+    if (clear) out.push(i);
+    await nextFrame();
+    if (token.cancelled) return;
+  }
+  if (out.length && out.length < found.length) {
+    const all = found;
+    found = out.map((i) => all[i]);
+    if (supportGrasps) supportGrasps = out.map((i) => supportGrasps![i]);
   }
   solveToken = null;
   grasps = found;
@@ -1222,6 +1297,7 @@ const actions: PanelActions = {
     const base = foundGrasps?.[ui.selected];
     if (!base || !grasps?.[ui.selected]) return;
     // while dragging, the hand just moves (keeping its fingers); they close again on letting go
+    dragging = !done;
     grasps[ui.selected] = { ...grasps[ui.selected], wrist: nudgedWrist(base.wrist) };
     selectGrasp(ui.selected, 0);
     if (done) void closeAgain();
@@ -1640,12 +1716,12 @@ function exportBase(): string {
 
 /** The chosen grip as a GLB: the user's own model posed, or the freshly rigged hand. */
 async function makeGlb(): Promise<Blob> {
-  const g = grasps![ui.selected];
+  const g = settle(grasps![ui.selected]);
   const h = hand!;
   const view = { ...viewer.view };
   try {
     viewer.setView({ bones: false, fit: false });
-    const posed: Grasp = { ...g, angles: anglesOf(g) };
+    const posed: Grasp = { ...g };
     const gripPose = { wrist: g.wrist, angles: posed.angles };
     const options = { includeObject: ui.exportObject, includeAnimation: ui.exportAnimation };
     const arm = armExport();
@@ -1663,9 +1739,9 @@ async function makeGlb(): Promise<Blob> {
 
 /** The chosen grip as data for game code. */
 function makePose() {
-  const g = grasps![ui.selected];
+  const g = settle(grasps![ui.selected]);
   const h = hand!;
-  const posed: Grasp = { ...g, angles: anglesOf(g) };
+  const posed: Grasp = { ...g };
   const json =
     ui.exportCharacter && h.char
       ? characterPoseJson(h.char, h.rig.model, posed, object?.name ?? null, object?.holder ?? null, armExport())
@@ -1941,6 +2017,14 @@ Object.assign(window as unknown as Record<string, unknown>, {
     /** For batch runs: find grips for what is marked now, and read the chosen grip's pose file (null when there is none). */
     solve: () => findGrips(),
     pose: () => (grasps?.length && hand ? makePose() : null),
+    /** What keeping the skin out of the item did to the chosen grip: depth per finger and the palm before and after (metres), how far the hand moved, what turned. */
+    skin() {
+      const g = grasps?.[ui.selected];
+      if (!g) return null;
+      settle(g);
+      const r = settledFrom.get(g)?.result;
+      return r ? { before: r.before.depth, after: r.after.depth, worst: r.after.worst, moved: r.moved, changes: r.changes, clear: r.clear } : null;
+    },
     /** How well a placed hand (address: place) lined up: metres left over, scale between the skeletons, bones used. */
     /** What setHinges did: joints put on the engine's hinges, and degrees between each one's old and new axis. */
     get hinged() {
@@ -1951,7 +2035,7 @@ Object.assign(window as unknown as Record<string, unknown>, {
     },
     /** Where the named bones of the chosen grip's hand are, in the object file's own axes (for a placed hand: where it ended up). */
     handAt(names: string[]) {
-      const g = grasps?.[0];
+      const g = grasps?.[0] && settle(grasps[0]);
       const char = hand?.char;
       if (!g || !char || !object) return null;
       object.source.updateMatrixWorld(true);
