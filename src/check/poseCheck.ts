@@ -1,8 +1,7 @@
-import { BufferAttribute, BufferGeometry, Quaternion, Vector3 } from 'three';
-import { MeshBVH } from 'three-mesh-bvh';
+import { type Bone, Quaternion, Vector3 } from 'three';
 import { WRIST_LIMITS, wristJoint } from '../app/armIk';
 import { type Body, type FingerName, type Limb, REGION_NAMES, Region, SIDES, type Side, armRegion, fingerTips, mainChild, posedSkin, restPos, worldDelta, worldPos } from './body';
-import { type HeldItem, depthInItem, depthInside, distanceToItem } from './items';
+import { type HeldItem, depthInItem, distanceToItem } from './items';
 
 /**
  * Whole-pose checks: one character pose (with whatever it holds) measured the way a person looking at it would judge it. Every
@@ -200,6 +199,8 @@ export function jointChecks(body: Body, limb: Limb): Check[] {
 
 /** Skin at a joint: an edge stretched this many times its rest length tears; a triangle this small or turned over is pinched; a ring this much nearer its joint has collapsed. */
 export const SKIN = { stretch: 1.8, area: 0.2, ring: 0.7 };
+/** A fold: neighbours whose faces agreed this well at rest (cosine) and now disagree this much. */
+const FOLD = { rest: 0.5, now: -0.5 };
 
 interface JointZone {
   id: string;
@@ -224,8 +225,11 @@ function zones(body: Body): JointZone[] {
 
 const inZone = (z: JointZone, r: number, b: number) => (r === z.a && b === z.b) || (r === z.b && b === z.a);
 
-/** Tear, pinch and collapse of the skin at each wrist, elbow and shoulder. `skin` is the posed skin (from `posedSkin`). */
-export function skinChecks(body: Body, skin: Float32Array[]): Check[] {
+/**
+ * Tear, pinch and collapse of the skin at each wrist, elbow and shoulder. `skin` is the posed skin (from `posedSkin`). `marks`,
+ * when given (one array per skin part), gets a 1 on every vertex of a torn edge or a pinched or folded triangle, for the sheet.
+ */
+export function skinChecks(body: Body, skin: Float32Array[], marks?: Uint8Array[]): Check[] {
   const out: Check[] = [];
   const A = new Vector3(), B = new Vector3(), C = new Vector3(), a = new Vector3(), b = new Vector3(), c = new Vector3();
   const n0 = new Vector3(), n1 = new Vector3();
@@ -241,6 +245,9 @@ export function skinChecks(body: Body, skin: Float32Array[]): Check[] {
         ringNow += Math.hypot(P[v * 3] - pivotNow.x, P[v * 3 + 1] - pivotNow.y, P[v * 3 + 2] - pivotNow.z);
         ringN++;
       }
+      // per triangle: rest and posed normals (unit), for the fold test across shared edges
+      const tris: number[] = [];
+      const nr: Vector3[] = [], np: Vector3[] = [];
       for (let t = 0; t + 2 < I.length; t += 3) {
         const i = I[t], j = I[t + 1], k = I[t + 2];
         if (!joint(i) && !joint(j) && !joint(k)) continue;
@@ -248,17 +255,35 @@ export function skinChecks(body: Body, skin: Float32Array[]): Check[] {
         a.fromArray(P, i * 3); b.fromArray(P, j * 3); c.fromArray(P, k * 3);
         for (const [p, q, pp, qq] of [[A, B, a, b], [B, C, b, c], [C, A, c, a]] as const) {
           const l0 = p.distanceTo(q);
-          if (l0 > 1e-5) stretch = Math.max(stretch, pp.distanceTo(qq) / l0);
+          if (l0 <= 1e-5) continue;
+          const r = pp.distanceTo(qq) / l0;
+          stretch = Math.max(stretch, r);
+          if (marks && r > SKIN.stretch) marks[pi][i] = marks[pi][j] = marks[pi][k] = 1;
         }
         n0.subVectors(B, A).cross(C.clone().sub(A));
         n1.subVectors(b, a).cross(c.clone().sub(a));
         const s0 = n0.length();
         if (s0 < 1e-9) continue;
-        // a triangle turned over counts as no area at all, measured against its own bone's turn
-        const bone = part.bone[i];
-        const facing = bone ? n0.clone().applyQuaternion(worldDelta(body, bone)).dot(n1) : n0.dot(n1);
-        area = Math.min(area, facing < 0 ? 0 : n1.length() / s0);
+        area = Math.min(area, n1.length() / s0);
+        if (marks && n1.length() / s0 < SKIN.area) marks[pi][i] = marks[pi][j] = marks[pi][k] = 1;
+        tris.push(t);
+        nr.push(n0.clone().normalize());
+        np.push(n1.clone().normalize());
       }
+      // folded over: two neighbours that faced the same way at rest now face apart. Measured against each other, not against a
+      // bone, because skin between two bones turns part of the way with each and no one bone's turn is its own.
+      const edges = new Map<string, number>();
+      tris.forEach((t, n) => {
+        for (const [u, v] of [[I[t], I[t + 1]], [I[t + 1], I[t + 2]], [I[t + 2], I[t]]]) {
+          const key = u < v ? `${u}-${v}` : `${v}-${u}`;
+          const m = edges.get(key);
+          if (m === undefined) { edges.set(key, n); continue; }
+          if (nr[n].dot(nr[m]) > FOLD.rest && np[n].dot(np[m]) < FOLD.now) {
+            area = 0;
+            if (marks) for (const q of [tris[n], tris[m]]) marks[pi][I[q]] = marks[pi][I[q + 1]] = marks[pi][I[q + 2]] = 1;
+          }
+        }
+      });
     });
     if (!ringN) continue;
     out.push(check(`${z.id}.tear`, `${z.about}: stretched`, stretch, 'x', SKIN.stretch));
@@ -273,72 +298,137 @@ export function skinChecks(body: Body, skin: Float32Array[]): Check[] {
 /** How deep one thing may be inside another (mm). A hand's skin gives where it presses on what it holds; nothing else does. */
 export const DEPTH = { handOnItem: 2, other: 1, bodyOnBody: 2 };
 
-interface RegionMesh {
-  region: Region;
-  bvh: MeshBVH;
-  P: Float32Array;
-  I: Uint32Array;
-  /** The region's bones as posed, head to main child: a point is only in a region near enough to its bones to be in its flesh. */
-  bones: [Vector3, Vector3][];
-  reach: number;
-}
-
-function segDistance(p: Vector3, a: Vector3, b: Vector3): number {
-  const abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
-  const l = abx * abx + aby * aby + abz * abz;
-  const t = l > 1e-12 ? Math.max(0, Math.min(1, ((p.x - a.x) * abx + (p.y - a.y) * aby + (p.z - a.z) * abz) / l)) : 0;
-  return Math.hypot(p.x - a.x - abx * t, p.y - a.y - aby * t, p.z - a.z - abz * t);
-}
-
 /**
- * How deep a point is in a region's skin. The skin of one region is not closed (it is open where the next region starts, and a
- * character's clothes are often shells laid over each other), so the nearest face's side alone calls a point past an open edge
- * inside; a point is only counted when it is also within the region's own thickness of its bones.
+ * The flesh of one bone: an elliptical rod round the bone from its head to its main child, as wide (across the body) and as deep
+ * (front to back) as the middle of the skin it carries at rest, turned with the bone. A region is the union of its bones' rods.
+ * The skin itself is not used for "is this point in the body": one region's skin is open where the next starts, and clothes are
+ * shells laid over each other, so a point past an open edge reads as inside it; a rod has no edges.
  */
-function depthInRegion(m: RegionMesh, p: Vector3): number {
-  let near = Infinity;
-  for (const [a, b] of m.bones) near = Math.min(near, segDistance(p, a, b));
-  if (near > m.reach) return 0;
-  return depthInside(m.bvh, m.P, m.I, p, m.reach);
+interface BoneVolume {
+  bone: Bone;
+  child: Bone | null;
+  region: Region;
+  /** Rest length past the head when there is no child. */
+  length: number;
+  /** The stretch of the bone this rod covers, as shares of its length: a limb narrows along its bone, so each bone is cut into slices. */
+  t0: number;
+  t1: number;
+  /** Rest direction of the rod, and the axes across it (world), with its half-width and half-depth along them. */
+  axis: Vector3;
+  u: Vector3;
+  w: Vector3;
+  ru: number;
+  rw: number;
 }
 
-/** One closed-enough surface per body region, built from the skin as it is posed. */
-function segments(body: Body, region: Region, pose: 'now' | 'rest'): [Vector3, Vector3][] {
-  const at = (b: import('three').Bone) => (pose === 'rest' ? restPos(body, b) : worldPos(b));
-  const out: [Vector3, Vector3][] = [];
-  for (const [b, r] of body.boneRegion) {
-    if (r !== region) continue;
-    const c = mainChild(b);
-    const a = at(b);
-    out.push([a, c ? at(c) : a.clone()]);
+const volumesOf = new WeakMap<Body, BoneVolume[]>();
+
+/** How much of a bone's skin lies inside its rod: the middle of the flesh, not the pockets and folds. */
+const ROD_SHARE = 0.6;
+/** Slices per bone: enough to follow a forearm from the elbow's bulk down to the wrist. */
+const ROD_SLICES = 4;
+
+export function boneVolumes(body: Body): BoneVolume[] {
+  let out = volumesOf.get(body);
+  if (out) return out;
+  out = [];
+  const byBone = new Map<Bone, number[]>();
+  for (const s of body.skin) {
+    for (let v = 0; v < s.bone.length; v++) {
+      const b = s.bone[v];
+      if (!b) continue;
+      let list = byBone.get(b);
+      if (!list) byBone.set(b, (list = []));
+      list.push(s.rest[v * 3], s.rest[v * 3 + 1], s.rest[v * 3 + 2]);
+    }
+  }
+  const p = new Vector3();
+  for (const [bone, pts] of byBone) {
+    if (pts.length < 3 * 12) continue;
+    const region = body.boneRegion.get(bone) ?? Region.Legs;
+    const child = mainChild(bone);
+    const a = restPos(body, bone);
+    let axis = child ? restPos(body, child).sub(a) : new Vector3();
+    let length = axis.length();
+    if (length < 1e-4) {
+      // no child: the rod runs to twice the middle of the bone's skin
+      const c = new Vector3();
+      for (let i = 0; i < pts.length; i += 3) c.add(p.set(pts[i], pts[i + 1], pts[i + 2]));
+      axis = c.divideScalar(pts.length / 3).sub(a).multiplyScalar(2);
+      length = axis.length();
+    }
+    if (length < 1e-4) continue;
+    axis.normalize();
+    // across the rod: the body's side and its facing, made square to the bone
+    let u = perp(new Vector3(1, 0, 0), axis);
+    if (u.lengthSq() < 1e-6) u = perp(body.forward.clone(), axis);
+    u.normalize();
+    const w = new Vector3().crossVectors(axis, u).normalize();
+    const du: number[][] = [], dw: number[][] = [];
+    for (let k = 0; k < ROD_SLICES; k++) { du.push([]); dw.push([]); }
+    for (let i = 0; i < pts.length; i += 3) {
+      p.set(pts[i], pts[i + 1], pts[i + 2]).sub(a);
+      const t = p.dot(axis) / length;
+      if (t < 0 || t > 1) continue;
+      const k = Math.min(ROD_SLICES - 1, Math.floor(t * ROD_SLICES));
+      du[k].push(Math.abs(p.dot(u)));
+      dw[k].push(Math.abs(p.dot(w)));
+    }
+    for (let k = 0; k < ROD_SLICES; k++) {
+      if (du[k].length < 6) continue;
+      du[k].sort((x, y) => x - y);
+      dw[k].sort((x, y) => x - y);
+      const ru = du[k][Math.floor(du[k].length * ROD_SHARE)], rw = dw[k][Math.floor(dw[k].length * ROD_SHARE)];
+      if (!(ru > 1e-3 && rw > 1e-3)) continue;
+      out.push({ bone, child, region, length: child ? 0 : length, t0: k / ROD_SLICES, t1: (k + 1) / ROD_SLICES, axis, u, w, ru, rw });
+    }
+  }
+  volumesOf.set(body, out);
+  return out;
+}
+
+export interface PosedVolume {
+  a: Vector3;
+  b: Vector3;
+  u: Vector3;
+  w: Vector3;
+  ru: number;
+  rw: number;
+}
+
+/** The rods where the bones are now, or at rest. */
+export function posedVolumes(body: Body, pose: 'now' | 'rest'): Map<Region, PosedVolume[]> {
+  const out = new Map<Region, PosedVolume[]>();
+  for (const v of boneVolumes(body)) {
+    const turn = pose === 'rest' ? new Quaternion() : worldDelta(body, v.bone);
+    const head = pose === 'rest' ? restPos(body, v.bone) : worldPos(v.bone);
+    const tail = v.child
+      ? pose === 'rest' ? restPos(body, v.child) : worldPos(v.child)
+      : head.clone().addScaledVector(v.axis.clone().applyQuaternion(turn), v.length);
+    const a = head.clone().lerp(tail, v.t0), b = head.clone().lerp(tail, v.t1);
+    let list = out.get(v.region);
+    if (!list) out.set(v.region, (list = []));
+    list.push({ a, b, u: v.u.clone().applyQuaternion(turn), w: v.w.clone().applyQuaternion(turn), ru: v.ru, rw: v.rw });
   }
   return out;
 }
 
-function regionMeshes(body: Body, skin: Float32Array[], pose: 'now' | 'rest' = 'now'): { meshes: Map<Region, RegionMesh>; all: Float32Array; offset: number[] } {
-  const offset: number[] = [];
-  let n = 0;
-  for (const s of skin) { offset.push(n); n += s.length; }
-  const all = new Float32Array(n);
-  skin.forEach((s, i) => all.set(s, offset[i]));
-  const lists = new Map<Region, number[]>();
-  body.skin.forEach((part, pi) => {
-    const o = offset[pi] / 3, I = part.index;
-    for (let t = 0; t + 2 < I.length; t += 3) {
-      const r0 = part.region[I[t]], r1_ = part.region[I[t + 1]], r2 = part.region[I[t + 2]];
-      const r = r0 === r1_ || r0 === r2 ? r0 : r1_ === r2 ? r1_ : r0;
-      (lists.get(r) ?? lists.set(r, []).get(r)!).push(I[t] + o, I[t + 1] + o, I[t + 2] + o);
-    }
-  });
-  const meshes = new Map<Region, RegionMesh>();
-  for (const [region, list] of lists) {
-    const g = new BufferGeometry();
-    g.setAttribute('position', new BufferAttribute(all, 3));
-    const I = Uint32Array.from(list);
-    g.setIndex(new BufferAttribute(I, 1));
-    meshes.set(region, { region, bvh: new MeshBVH(g), P: all, I, bones: segments(body, region, pose), reach: body.thickness[region] * 1.25 + 0.005 });
+/** How deep a point is inside any of a region's rods (metres): how far in from the rod's surface, scaled to its thinner side. */
+export function depthInRods(rods: PosedVolume[] | undefined, p: Vector3): number {
+  if (!rods) return 0;
+  let best = 0;
+  for (const r of rods) {
+    const abx = r.b.x - r.a.x, aby = r.b.y - r.a.y, abz = r.b.z - r.a.z;
+    const l = abx * abx + aby * aby + abz * abz;
+    const px = p.x - r.a.x, py = p.y - r.a.y, pz = p.z - r.a.z;
+    const t = l > 1e-12 ? Math.max(0, Math.min(1, (px * abx + py * aby + pz * abz) / l)) : 0;
+    const ox = px - abx * t, oy = py - aby * t, oz = pz - abz * t;
+    // past either end the rod is capped round: the overshoot along the bone counts against its thinner side
+    const along = l > 1e-12 ? (ox * abx + oy * aby + oz * abz) / Math.sqrt(l) : 0;
+    const e = Math.hypot((ox * r.u.x + oy * r.u.y + oz * r.u.z) / r.ru, (ox * r.w.x + oy * r.w.y + oz * r.w.z) / r.rw, along / Math.min(r.ru, r.rw));
+    if (e < 1) best = Math.max(best, (1 - e) * Math.min(r.ru, r.rw));
   }
-  return { meshes, all, offset };
+  return best;
 }
 
 const restDepths = new WeakMap<Body, Map<string, Float32Array>>();
@@ -364,8 +454,8 @@ function bodyPairs(body: Body): [Region, Region, string][] {
   return out;
 }
 
-function bodyDepths(body: Body, skin: Float32Array[], meshes: Map<Region, RegionMesh>, from: Region, into: Region): { depth: Float32Array; part: number[]; vert: number[] } {
-  const target = meshes.get(into);
+function bodyDepths(body: Body, skin: Float32Array[], rods: Map<Region, PosedVolume[]>, from: Region, into: Region): { depth: Float32Array; part: number[]; vert: number[] } {
+  const target = rods.get(into);
   const part: number[] = [], vert: number[] = [];
   const depth: number[] = [];
   const p = new Vector3();
@@ -376,7 +466,7 @@ function bodyDepths(body: Body, skin: Float32Array[], meshes: Map<Region, Region
       part.push(pi); vert.push(v);
       if (!target) { depth.push(0); continue; }
       p.fromArray(skin[pi], v * 3);
-      depth.push(depthInRegion(target, p));
+      depth.push(depthInRods(target, p));
     }
   });
   return { depth: Float32Array.from(depth), part, vert };
@@ -389,18 +479,18 @@ function bodyDepths(body: Body, skin: Float32Array[], meshes: Map<Region, Region
  */
 export function overlapChecks(body: Body, skin: Float32Array[], items: HeldItem[]): Check[] {
   const out: Check[] = [];
-  const { meshes } = regionMeshes(body, skin);
+  const rods = posedVolumes(body, 'now');
 
   // body against body, relative to rest
   let rest = restDepths.get(body);
   if (!rest) {
     rest = new Map();
-    const { meshes: rm } = regionMeshes(body, body.skin.map((s) => s.rest), 'rest');
+    const rm = posedVolumes(body, 'rest');
     for (const [a, b] of bodyPairs(body)) rest.set(`${a}-${b}`, bodyDepths(body, body.skin.map((s) => s.rest), rm, a, b).depth);
     restDepths.set(body, rest);
   }
   for (const [a, b, about] of bodyPairs(body)) {
-    const now = bodyDepths(body, skin, meshes, a, b);
+    const now = bodyDepths(body, skin, rods, a, b);
     const was = rest.get(`${a}-${b}`)!;
     let worst = 0;
     for (let i = 0; i < now.depth.length; i++) worst = Math.max(worst, now.depth[i] - (was[i] ?? 0));
@@ -429,9 +519,9 @@ export function overlapChecks(body: Body, skin: Float32Array[], items: HeldItem[
     const S = item.samples;
     for (let i = 0; i < S.length; i += 3) {
       p.set(S[i], S[i + 1], S[i + 2]).applyMatrix4(item.matrix);
-      for (const m of meshes.values()) {
-        const d = depthInRegion(m, p);
-        if (d > (inBody.get(m.region) ?? 0)) inBody.set(m.region, d);
+      for (const [region, list] of rods) {
+        const d = depthInRods(list, p);
+        if (d > (inBody.get(region) ?? 0)) inBody.set(region, d);
       }
     }
     for (const [r, d] of inBody) {

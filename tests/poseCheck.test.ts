@@ -169,6 +169,26 @@ describe('whole-pose checks', () => {
     expect(overlapChecks(body, posedSkin(body), [g]).every((c) => c.pass)).toBe(true);
   });
 
+  it('find nothing inside a body part that is only in line with its bones, past their ends', () => {
+    restPose(body);
+    // a block straight on from the right arm's fingertips, well clear of the hand
+    const tip = worldPos(body.limbs.right!.hand).clone();
+    const out = tip.clone().sub(worldPos(body.limbs.right!.fore)).normalize();
+    const at = tip.addScaledVector(out, 0.35);
+    const block = makeItem('block', [box('block', [-0.01, -0.01, -0.01], [0.01, 0.01, 0.01])], { matrix: new Matrix4().makeTranslation(at.x, at.y, at.z) });
+    const bad = overlapChecks(body, posedSkin(body), [block]).filter((c) => !c.pass);
+    expect(bad.map((c) => `${c.id} ${c.value}`)).toEqual([]);
+  });
+
+  it('fail wrist skin folded back over itself', () => {
+    restPose(body);
+    // the hand bent back flat onto the forearm
+    const l = body.limbs.left!;
+    turn(l.hand, new Vector3(0, 0, 1), 170);
+    expect(by(skinChecks(body, posedSkin(body)), 'left.skin.wrist.pinch').pass).toBe(false);
+    restPose(body);
+  });
+
   it('fail an elbow pointed in at the chest', () => {
     const l = body.limbs.right!;
     restPose(body);

@@ -1,5 +1,5 @@
 import { type Bone, Matrix4, Quaternion, Vector3 } from 'three';
-import { type Body, key, restQuat, setWorld, worldPos } from './body';
+import { type Body, key, restQuat, setWorld, worldDelta, worldPos } from './body';
 
 /**
  * Reading a Handhold pose file (docs/pose-format.md) back onto a character the way an engine does: each finger bone is given its
@@ -31,16 +31,23 @@ export function findBone(body: Body, name: string): Bone | null {
   return body.bones.find((b) => key(b.name) === k) ?? null;
 }
 
-/** Gives every finger bone the file names its turn from rest (parents first, so a child's world turn is exact). Returns names not found. */
-export function applyFingerDeltas(body: Body, bones: PoseFileBone[]): string[] {
+/**
+ * Gives every finger bone the turn the file names (parents first, so a child's world turn is exact). A file's `delta` is the
+ * finger's own turn, read with the arm at rest, so it is carried by however the hand is turned now: world = hand's turn from
+ * rest * delta * rest. Returns names not found.
+ */
+export function applyFingerDeltas(body: Body, bones: PoseFileBone[], handBone?: string): string[] {
   const missing: string[] = [];
   const found = bones.map((pb) => ({ pb, b: findBone(body, pb.name) }));
+  const hand = handBone ? findBone(body, handBone) : null;
+  hand?.updateWorldMatrix(true, false);
+  const carry = hand ? worldDelta(body, hand) : new Quaternion();
   // parents before children
   const depth = (b: Bone) => { let d = 0; for (let p = b.parent; p; p = p.parent) d++; return d; };
   found.sort((a, b) => (a.b ? depth(a.b) : 0) - (b.b ? depth(b.b) : 0));
   for (const { pb, b } of found) {
     if (!b) { missing.push(pb.name); continue; }
-    const q = new Quaternion().fromArray(pb.delta).multiply(restQuat(body, b));
+    const q = carry.clone().multiply(new Quaternion().fromArray(pb.delta)).multiply(restQuat(body, b));
     setWorld(b, worldPos(b), q);
   }
   return missing;

@@ -53,6 +53,16 @@ function edgeSamples(P: Float32Array, I: Uint32Array, out: number[]) {
   }
 }
 
+/** The volume a closed surface encloses: positive when its faces wind counter-clockwise seen from outside. */
+export function signedVolume(P: ArrayLike<number>, I: ArrayLike<number>): number {
+  let v = 0;
+  for (let t = 0; t + 2 < I.length; t += 3) {
+    const a = I[t] * 3, b = I[t + 1] * 3, c = I[t + 2] * 3;
+    v += P[a] * (P[b + 1] * P[c + 2] - P[b + 2] * P[c + 1]) - P[a + 1] * (P[b] * P[c + 2] - P[b + 2] * P[c]) + P[a + 2] * (P[b] * P[c + 1] - P[b + 1] * P[c]);
+  }
+  return v / 6;
+}
+
 export function makeItem(
   name: string,
   parts: ObjPart[],
@@ -62,6 +72,9 @@ export function makeItem(
   const samples: number[] = [];
   const min = new Vector3(Infinity, Infinity, Infinity), max = new Vector3(-Infinity, -Infinity, -Infinity);
   for (const p of parts) {
+    // a piece whose faces wind inwards (an exporter that mirrored it without turning its faces) is turned the right way out:
+    // every inside test reads the faces' winding
+    if (signedVolume(p.positions, p.index) < 0) for (let t = 0; t + 2 < p.index.length; t += 3) [p.index[t + 1], p.index[t + 2]] = [p.index[t + 2], p.index[t + 1]];
     const g = new BufferGeometry();
     g.setAttribute('position', new BufferAttribute(p.positions, 3));
     g.setIndex(new BufferAttribute(p.index, 1));
