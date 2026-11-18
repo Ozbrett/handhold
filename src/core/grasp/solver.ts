@@ -45,6 +45,12 @@ export interface GraspSettings {
   adjust?: { move: number; turn: number };
   /** With `adjust`: a fingertip (finger index) that should reach a spot (solve space), a trigger finger and its trigger; places it can reach from count for more. */
   reach?: { finger: number; point: Vector3 };
+  /**
+   * With `adjust`: how deep the drawn skin (not the collision spheres) is in the object for a pose, metres. The spheres sit inside the
+   * skin, so a place the spheres call clear can leave a thumb a centimetre in the part; the skin guard then has to push the whole hand
+   * out and the wrap is lost. Weighing the skin here picks a place the skin itself holds from.
+   */
+  skinDepth?: (wrist: Matrix4, angles: Float32Array) => number;
 }
 
 /** The palm's outward surface normal and the knuckle-to-thumb direction a hand needs to point its fingers and thumb as `aim` asks. */
@@ -818,8 +824,10 @@ async function adjustPlacement(
     });
     // how far the fingertip that has a spot to reach stops short of it, as a share of a third of the hand
     const short = reach ? Math.min(1, reachFingertip(model, g.angles, reach.finger, reach.point.clone().applyMatrix4(g.wrist.clone().invert())).miss / (0.3 * model.size)) : 0;
+    // skin left in the part, as a share of a tenth of the hand: a centimetre of thumb in a grip costs more than holding a little worse
+    const skin = solver.settings.skinDepth ? Math.max(0, solver.settings.skinDepth(g.wrist, g.angles) - solver.tol) / (0.1 * model.size) : 0;
     const value =
-      g.score + (g.stable ? 0.25 : 0) + (g.palmTouching ? 0.1 : 0) + 0.12 * wrapped - 0.6 * short - 0.15 * (moved * moved + turned * turned);
+      g.score + (g.stable ? 0.25 : 0) + (g.palmTouching ? 0.1 : 0) + 0.12 * wrapped - 0.6 * short - 0.15 * (moved * moved + turned * turned) - 0.5 * skin;
     return { g, value };
   };
   // started from where the hand was put and from a few places along the knuckles' line (a finger level with a trigger guard's bar
