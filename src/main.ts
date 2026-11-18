@@ -14,6 +14,7 @@ import { graspQuality } from './core/grasp/quality';
 import { type ArmExport, type ArmMode, characterPoseJson, download, exportCharacterGlb, exportGlb, poseJson } from './app/exporter';
 import { type Engine, type EnginePackage, blenderPackage, godotPackage, unityPackage } from './app/packages';
 import { type HandPose, type RiggedHand, buildRiggedHand } from './app/handRig';
+import { onOwnSkeleton } from './app/ownSkeleton';
 import { type Baked, bakeToTriMesh, loadModelFile, looksLikeCharacter, subsetBaked } from './app/loaders';
 import { SAMPLE_OBJECTS, sampleCharacter, sampleHand } from './app/samples';
 import { Panel, type PanelActions, type PanelState, type StepId } from './app/ui';
@@ -471,12 +472,10 @@ function rebuildHand() {
   // the rest pose is read from the bones: put the free arm back first
   if (hand.free) hangArm(hand.free, false);
   try {
-    const analysis = analyzeHandMesh(hand.baked.mesh, {
-      flipPalm: hand.flip,
-      joints: hand.edits.joints,
-      thumbTurn: (hand.edits.thumbTurn * Math.PI) / 180,
-    });
-    hand.char = buildCharacterRig(hand.source, hand.full, hand.subset, analysis);
+    const options = { flipPalm: hand.flip, joints: hand.edits.joints, thumbTurn: (hand.edits.thumbTurn * Math.PI) / 180 };
+    const own = onOwnSkeleton(hand.source, hand.full, hand.subset, hand.baked, analyzeHandMesh(hand.baked.mesh, options), options);
+    const analysis = own.analysis;
+    hand.char = own.char;
     hinged = hand.char && hinges ? useHinges(hand.char, analysis.model, hinges) : null;
     applyFingerLimits(analysis.model);
     hand.rig = buildRiggedHand(hand.baked, analysis);
@@ -856,10 +855,12 @@ function buildSupport(): SupportEntry | null {
     for (const mask of [o.keep, o.keepWide]) {
       try {
         const b = subsetBaked(hand.full, mask);
-        const a = analyzeHandMesh(b.mesh, { flipPalm: o.flip });
-        if (a.spec.fingers.length < o.fingers) continue;
+        const a0 = analyzeHandMesh(b.mesh, { flipPalm: o.flip });
+        if (a0.spec.fingers.length < o.fingers) continue;
+        const own = onOwnSkeleton(hand.source, hand.full, mask, b, a0, { flipPalm: o.flip });
+        const a = own.analysis;
         applyFingerLimits(a.model);
-        const char = buildCharacterRig(hand.source, hand.full, mask, a);
+        const char = own.char;
         if (!char || char.handBone === hand.char?.handBone) continue;
         const arm = armFor(char, a.model.frame);
         if (!arm) continue;
@@ -1028,14 +1029,17 @@ async function setHand(source: Object3D, name: string, flip = false, subset: Uin
         throw new Error('A hand was found on this model, but its fingers are too fused or too coarse to rig separately.');
       }
     }
-    applyFingerLimits(analysis!.model);
-    const rig = buildRiggedHand(baked, analysis!);
+    // on a character the hand bends about its own bones with its own weights, so what is drawn is what is exported
+    const own = onOwnSkeleton(source, full, subset, baked, analysis!, { flipPalm: flip });
+    analysis = own.analysis;
+    applyFingerLimits(analysis.model);
+    const rig = buildRiggedHand(baked, analysis);
     const restBox = new Box3();
     const p = baked.mesh.positions;
     const v = new Vector3();
     for (let i = 0; i < p.length; i += 3) restBox.expandByPoint(v.set(p[i], p[i + 1], p[i + 2]));
     dropSupport();
-    const char = buildCharacterRig(source, full, subset, analysis!);
+    const char = own.char;
     hold = sweepFrom = sweepTo = null;
     saved = [];
     ui.shown = -1;

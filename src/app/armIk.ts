@@ -74,7 +74,7 @@ export interface ArmRig {
   limits: BodyLimits;
 }
 
-interface WristJoint {
+export interface WristJoint {
   /** Elbow to wrist. */
   axis: Vector3;
   /** Turning about this bends the hand towards the palm. */
@@ -199,7 +199,7 @@ export function setBodyLimits(arm: ArmRig, limits: Partial<BodyLimits>) {
   arm.pole.copy(elbowPole(arm.outward, arm.forward, arm.limits.elbowOut));
 }
 
-function wristJoint(shoulder: Vector3, elbow: Vector3, wrist: Vector3, forward: Vector3, palm?: PalmAtRest): WristJoint {
+export function wristJoint(shoulder: Vector3, elbow: Vector3, wrist: Vector3, forward: Vector3, palm?: PalmAtRest): WristJoint {
   const axis = wrist.clone().sub(elbow).normalize();
   const fallbackN = perp(new Vector3(0, -1, 0), axis);
   let n = palm ? perp(palm.normal, axis) : fallbackN;
