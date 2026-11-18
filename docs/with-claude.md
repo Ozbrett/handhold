@@ -176,6 +176,14 @@ Unity -batchmode -nographics -quit -projectPath P -executeMethod HandholdCheck.R
 
 [development.md](development.md) explains how to produce the fixture these read. There is no such check for Godot yet.
 
+Claude also checks the poses themselves, not just the bones. `scripts/hold-check.mjs` and `scripts/motion-check.mjs` run the whole-pose checks (joints in range, no torn or folded skin, nothing inside anything, elbows out, the gun the right way up, hands staying on what they hold) and draw a sheet with every fault in red. The skill has Claude answer four questions in order: do the machine checks pass; what does the sheet show; does the picture agree with the checks (if it shows something wrong that passed, the check is wrong and is fixed first); and only then approve or reject with a note saying what it saw:
+
+```bash
+node scripts/review.mjs approve checked tt_33 --note "palm on the grip, trigger finger on the trigger, elbow down and out"
+```
+
+`handhold.mjs` treats its exports as final only when `--review checked` shows everything approved (or with `--unreviewed`), so a pose nobody looked at does not slip through.
+
 Before a grip, Claude can check the character itself. A second skill, `.claude/skills/rig-doctor`, runs [Rig Doctor](rig-doctor.md): it measures the sleeve over the hand, the cuff weights and how thick the wrist stays when the hand rolls and bends, fixes what fails, and renders a before and after sheet to look at. Ask "the wrists contort when my character holds the gun, fix the model". Copy that skill into a game project the same way as this one.
 
 ## Things worth knowing

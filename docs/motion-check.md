@@ -70,15 +70,34 @@ One JSON file, `motion.json`, next to the item OBJs it names. Paths are relative
 | Field | Meaning |
 |---|---|
 | `name`, `fps` | The clip's name and how many frames a second were sampled. Sample at the game's own rate or faster; joint speed is measured between frames |
-| `view` | `"first"`: the player's own view is checked and shown (the head camera, or `camera` per frame when given). `"third"`: seen from outside only |
+| `view` | `"first"` or `"third"`. Read but not yet used: every sheet shows an eye view from the head bone either way |
 | `loops` | `true` when the end must run straight back into the start (the first and last frames are compared in position and speed). A clip that does not loop is still compared with the hold pose when the clip names `hold` |
 | `hold` | Optional: the name of another clip whose first frame is the hold this clip leaves from and returns to; the first and last frames must match it |
 | `contacts` | Each span of time in which a hand must stay on an item. `hand` is `"right"` or `"left"`, `item` an item's name, `from` and `to` in seconds. Throughout the span the hand's skin, measured in the item's own space, must not move more than `maxSlipMm` (default 1) from where it was at `from`. That catches a hand that slides, lets go, or whose fingers open |
-| `frames` | One per sampled moment: `t` in seconds, `bones` (world space, one per top-level bone, `[px, py, pz, qx, qy, qz, qw]`), `items` (world space, one per top-level item; an item not shown in a frame may be `null`), and optionally `camera` (the eye's world transform, looking down its own forward axis) |
+| `frames` | One per sampled moment: `t` in seconds, `bones` (world space, one per top-level bone, `[px, py, pz, qx, qy, qz, qw]`), `items` (world space, one per top-level item; an item not shown in a frame may be `null`), and optionally `camera` (the eye's world transform; read and carried through, not yet drawn from) |
 
 ## What is checked, per frame
 
-The same whole-pose checks Handhold runs on its own poses ([how-it-works.md](how-it-works.md#checking-a-whole-pose)): joint ranges of the arms and fingers, the skin at wrist, elbow and shoulder, items against the drawn body and against each other, hand against hand, arms against the torso and head, the elbow out from the body, and each item's way up. Across frames: slip on each contact, the speed of every joint (a pop is a joint turning faster than a person can), and the start and end against each other or against the hold.
+The same whole-pose checks Handhold runs on its own poses ([how-it-works.md](how-it-works.md#checking-a-whole-pose)): joint ranges of the arms and fingers, the skin at wrist, elbow and shoulder, items against the drawn body and against each other, hand against hand, arms against the torso and head, the elbow out from the body, and each item's way up. Each is reported at its worst frame. Across frames:
+
+| Check | Fails when |
+|---|---|
+| `lineup` | Handhold's copy of the character does not line up with the file's `rest` to within 10 mm (rms): wrong file, wrong axes, or bones named differently |
+| `contact.<hand>.<item>` | During the span, the hand's own skin (not the wrist skin it shares with the forearm, which follows the forearm) moves more than `maxSlipMm` in the item's space from where it was at `from` |
+| `speed` | A bone turns faster than 1000 degrees a second against its parent between two frames: a pop. Quick human movements (a flick of the wrist) reach several hundred |
+| `ends.start.*`, `ends.end.*` | The first or last frame is more than 1 mm or 1 degree from the hold's (or, for a loop, from each other) |
+| `ends.speed` | A clip that leaves a hold starts or ends moving faster than 30 degrees a second (a loop: its speed at the end differs from its speed at the start by more) |
+
+## Making a reload to check
+
+`scripts/make-reload.mjs` builds a reload out of attachments and writes it as a motion file, so a game can start from one that passes: the shooting hand stays on the grip for the whole clip; the other hand goes from where it holds the gun (or from just under the magazine) to the magazine, draws it out (slid, or rocked about its front top corner for a rifle), puts it back without letting go, and returns. It writes two clips, `<name>_hold` and `<name>`, which leaves and lands on the hold.
+
+```bash
+node scripts/make-reload.mjs --character Crew.fbx --gun gun_1_tt_33.obj --name tt_33 --out out/tt_33   --grip right=grip_1_right.pose.json --mag reload_1_left.pose.json --mag-pieces Baseplate --mag-slide 60
+node scripts/make-reload.mjs --character Crew.fbx --gun gun_4_akm.obj --name akm --out out/akm   --grip right=grip_4_right.pose.json --support fore_4_left.pose.json --mag reload_4_left.pose.json   --mag-pieces "#23,#24,#25,#26,#27,#28,#29,#30" --mag-rock 25
+```
+
+A piece is named as the OBJ names it, or as `#n` (its place in the file) when names repeat. The gun is placed in front of the chest, `--below` metres (default 0.2) under the eye, as far out as keeps every hand place (the magazine home and drawn out) within reach and the gun out of the head and chest. It is built from the pose files it is given: when those put a hand inside the gun, so does the reload, and the check says so.
 
 ## What comes out
 

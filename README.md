@@ -109,6 +109,15 @@ A grip is only as good as the wrist it is on. [Rig Doctor](docs/rig-doctor.md) c
 node scripts/rig-doctor.mjs fix character.blend --save character_fixed.blend --shots out/wrists
 ```
 
+Every hold and every animation can be checked as a whole pose before it is used: joints in range, skin neither torn nor folded at the wrist, elbow and shoulder, nothing inside anything (hand, item, chest), elbows out from the body, the gun the right way up, and in an animation each hand staying on what it holds with no joint popping. Each check draws a contact sheet with every fault in red, and nothing is final until someone (or Claude) has looked at it and approved it:
+
+```bash
+node scripts/motion-check.mjs --motion reload/motion.json --out checked
+node scripts/review.mjs approve checked reload --note "left hand stays on the magazine, elbows out"
+```
+
+A game hands over its own animations as a [motion file](docs/motion-check.md); `scripts/make-reload.mjs` builds a reload that keeps the shooting hand on the grip while the other hand draws the magazine and puts it back without letting go.
+
 Before any of that, [Rig Check](docs/rig-check.md) says whether a model will animate at all without warping: its skeleton against
 a default rig, every weight, and every joint turned as far as animation turns it while the skin is measured (thickness kept,
 edges torn, skin dragged or left behind). It fixes what can be fixed in the weights, for people and creatures alike:

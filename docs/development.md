@@ -32,6 +32,7 @@ Open the address it prints (usually http://localhost:5173/).
 | `src/core/grasp` | Grip search, finger closing, the linear program and the stability score |
 | `src/core/sample` | The built-in hand, player and props, generated from distance fields |
 | `src/app` | The 3D view, file loading, the panel, the arm, saved poses, animations and looks, export, and matching a grip to an existing skeleton |
+| `src/check` | Checking a whole pose with no browser: the body and pose-file readers, the whole-pose checks, the software rasteriser and contact sheets, the review file, animations with attachments, the motion file and the reload |
 | `unity`, `godot`, `blender` | The scripts that go inside each export |
 | `tests` | Unit tests, including a real hand mesh with a known skeleton |
 | `scripts` | Headless tools and checks, listed below |
@@ -49,6 +50,9 @@ None of these opens a window. The browser ones use an installed Microsoft Edge i
 | `npm run e2e` | Drives the built site through the grip steps and validates the exported GLB and the three engine downloads |
 | `node scripts/ux-check.mjs` | The Character and Animations tabs: poses, animations and looks, moving the item with the hand following, limits, and what the export contains |
 | `node scripts/doc-shots.mjs` | Not a check: retakes the pictures in `docs/` |
+| `npm run typecheck` | The TypeScript types |
+
+The whole-pose checks have their own tests (`tests/poseCheck.test.ts`, `tests/motion.test.ts`), each watched failing on a broken pose: a hand pushed into a block, an elbow through the chest, a wrist's skin folded back, a hand that lets go of the magazine, a gun upside down.
 
 ## Trying your own models
 
@@ -80,6 +84,10 @@ It is driven by environment variables. `scripts/handhold.mjs` wraps the same run
 |---|---|
 | `scripts/handhold.mjs` | The command-line front end: one prop, one folder of exports and a summary |
 | `scripts/game-holds.mjs` | Solves every hold a game already places, from a manifest the game writes |
+| `scripts/hold-check.mjs` | Checks one hold on a character and draws its sheet ([command-line.md](command-line.md#checking-a-hold-a-motion-and-the-verdict)) |
+| `scripts/motion-check.mjs` | Checks a motion file frame by frame ([motion-check.md](motion-check.md)) |
+| `scripts/make-reload.mjs` | Builds a reload from attachments as a motion file |
+| `scripts/review.mjs` | Records a verdict on a checked hold or motion |
 | `scripts/game-view.mjs` | Close-ups of a game's own hands for the same holds, to compare with |
 | `scripts/try-fist.mjs` | Curls a hand's fingers and photographs it from three sides, to check a rig at a glance |
 | `scripts/view-model.mjs` | Loads any model as the object and photographs it, with close-ups of its ends |

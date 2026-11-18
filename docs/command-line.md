@@ -8,7 +8,7 @@ node scripts/handhold.mjs --hand character.glb --object torch.glb --grip 0.25,0.
 
 It needs [Node.js](https://nodejs.org) 22.12 or newer and an installed Microsoft Edge, which it runs headless. Set `E2E_CHANNEL=chrome` to use Chrome. The first run builds the site into `dist/`; add `--build` to build again after changing the source.
 
-It exits with 0 only if a grip holds, every export was written and the page reported no errors.
+It exits with 0 only if a grip holds, every export was written, the page reported no errors, and the holds have been checked and approved: `--review <folder>` names the `review.json` folder that `hold-check.mjs` or `motion-check.mjs` wrote for them, and the run exits 3 while anything there fails, is pending or is rejected. Without `--review` it exits 3 too. `--unreviewed` takes the exports without a review (only a grip that does not hold fails the run).
 
 ## Options
 
@@ -67,6 +67,8 @@ Walk, run and idle loop. With a two-handed grip, `second` makes the second hand 
 |---|---|
 | `--out <folder>` | Where to write everything. Default `handhold-out/<hand>-<object>` |
 | `--name <name>` | File name prefix. Default `grip` |
+| `--review <folder>` | The folder whose `review.json` holds the verdicts on these holds (below) |
+| `--unreviewed` | Final without a review |
 
 ## What it writes
 
@@ -124,3 +126,42 @@ If the game's arms bend each finger joint about a single hinge, the manifest can
 After each solve the script measures how far the hand's drawn skin goes into the whole held mesh (every part of the OBJ, not just the grip), per finger and the palm. The solver keeps its collision spheres clear, but the skin over a thumb's root can stand well past them. A finger deeper than `--skin-mm` (default 5) is taken out of the mesh: its end joints, its knuckle or the whole finger are opened or closed in tenths of their range, measuring the skin each time, and the shallowest is kept. The trigger finger stays where the game put it. Each hold's line, and `summary.json` (`depth`, in metres, and `cleared`), says what moved. A finger still deeper is listed under `problems`, and the script exits with an error.
 
 It writes one pose file per hold, plus a `summary.json` with each hold's grip quality and where the hand ended up (`placeAfter`), so the game can move its hand there too.
+
+## Checking a hold, a motion, and the verdict
+
+These need no browser. Each draws a contact sheet, runs the whole-pose checks ([how-it-works.md](how-it-works.md#checking-a-whole-pose)) and records the result in `<out>/review.json` as pending, for a person or Claude to look at and approve or reject. Exit codes: 0 when every check passes and everything in the review is approved, 3 when anything fails, is pending or is rejected (`--unreviewed`: only failures count), 1 on an error.
+
+**A hold**, as the game shows it: the item aimed from the eye, each hand's pose file put on it, both arms solved, every check run, one sheet (front, left, right, back, above, the eye) with every fault painted red on top.
+
+```bash
+node scripts/hold-check.mjs --character Crew.fbx --item gun_1_tt_33.obj --name tt_33 --out checked \
+  --hand "right=grip_1_right.pose.json;grip=Grip"
+```
+
+| Option | Meaning |
+|---|---|
+| `--character` | FBX or GLB, or `sample` for the built-in player |
+| `--item`, `--name` | The held OBJ (in the character's space; `--unmirrored` when it is still in Unity's axes) and the name it is recorded under |
+| `--hand side=<pose.json>[;grip=A,B][;wrap=middle,ring,pinky]` | A hand's pose file, once per hand; `grip` names the pieces the palm must hold, `wrap` the fingers that must close round them |
+| `--style`, `--forward`, `--up` | What way up the item must be. Default `gun`, forward `0,0,1`, up `0,1,0` |
+
+**A motion**, frame by frame ([motion-check.md](motion-check.md)): one sheet per clip, eight moments down the page.
+
+```bash
+node scripts/motion-check.mjs --motion out/motion.json --out checked [--unreviewed]
+```
+
+**A reload to check**, built from attachments ([motion-check.md](motion-check.md#making-a-reload-to-check)):
+
+```bash
+node scripts/make-reload.mjs --character Crew.fbx --gun gun_1_tt_33.obj --name tt_33 --out out \
+  --grip right=grip_1_right.pose.json --mag reload_1_left.pose.json --mag-pieces Baseplate --mag-slide 60
+```
+
+**The verdict**, after looking at the sheet. A note is required; a failing item cannot be approved; an item whose inputs or checks change goes back to pending.
+
+```bash
+node scripts/review.mjs status  checked
+node scripts/review.mjs approve checked tt_33 --note "grip in the palm, trigger finger on the trigger, elbow down"
+node scripts/review.mjs reject  checked tt_33 --note "hand 15 mm inside the grip"
+```
