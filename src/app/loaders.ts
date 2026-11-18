@@ -1,4 +1,5 @@
 import {
+  type Bone,
   BufferAttribute,
   BufferGeometry,
   Color,
@@ -39,6 +40,7 @@ export async function loadModelFile(file: File): Promise<Object3D> {
     } else if (ext === 'fbx') {
       root = new FBXLoader().parse(buffer, '');
       dropMissingTextures(root);
+      mergeSubBones(root);
     } else if (ext === 'obj') {
       root = new OBJLoader().parse(new TextDecoder().decode(buffer));
     } else {
@@ -56,6 +58,43 @@ export async function loadModelFile(file: File): Promise<Object3D> {
   root.updateMatrixWorld(true);
   if (collectMeshes(root).length === 0) throw new Error(`"${file.name}" contains no mesh.`);
   return root;
+}
+
+/**
+ * three's FBXLoader gives each skinned mesh after the first its own copy of a bone they share, hung under the original with no
+ * offset: a character in four meshes reads as hand > hand > hand > forearm. The arm search then took a zero-length copy for the
+ * forearm and found no arm, and turning one copy moved only one mesh. Each copy is folded back into the bone it copies.
+ */
+export function mergeSubBones(root: Object3D): number {
+  const copies: Bone[] = [];
+  root.traverse((o) => {
+    const b = o as Bone, p = o.parent as Bone | null;
+    if (!b.isBone || !p?.isBone || b.name !== p.name) return;
+    const identity = b.position.lengthSq() < 1e-12 && Math.abs(Math.abs(b.quaternion.w) - 1) < 1e-6
+      && Math.abs(b.scale.x - 1) < 1e-6 && Math.abs(b.scale.y - 1) < 1e-6 && Math.abs(b.scale.z - 1) < 1e-6;
+    if (identity) copies.push(b);
+  });
+  if (!copies.length) return 0;
+  // the original of each copy, following a copy of a copy up to the bone that is not one
+  const copySet = new Set(copies);
+  const originalOf = (b: Bone): Bone => {
+    let o = b;
+    while (copySet.has(o)) o = o.parent as Bone;
+    return o;
+  };
+  root.traverse((o) => {
+    const mesh = o as SkinnedMesh;
+    if (!mesh.isSkinnedMesh || !mesh.skeleton) return;
+    mesh.skeleton.bones = mesh.skeleton.bones.map((b) => (copySet.has(b) ? originalOf(b) : b));
+  });
+  // deepest first, so a copy's children land on the original and not on another copy
+  for (const c of copies.reverse()) {
+    const original = originalOf(c);
+    for (const child of [...c.children]) original.add(child);   // the copy has no offset, so the child's own transform still holds
+    c.removeFromParent();
+  }
+  root.updateMatrixWorld(true);
+  return copies.length;
 }
 
 /**

@@ -26,6 +26,7 @@ import {
   Raycaster,
   Scene,
   ShadowMaterial,
+  SkeletonHelper,
   SphereGeometry,
   Sphere,
   TorusGeometry,
@@ -78,6 +79,8 @@ export class Viewer {
   /** Holds the object, grip mark and contact dots; moved as one into a character's hand. */
   private readonly stage = new Group();
   private character: Object3D | null = null;
+  /** The character's own skeleton, drawn through its skin in character view when Bones is on. */
+  private characterBones: SkeletonHelper | null = null;
   characterView = false;
   private readonly gizmo: TransformControls;
   private readonly gizmoProxy = new Object3D();
@@ -295,10 +298,30 @@ export class Viewer {
   /** The original model with its own skeleton, shown instead of the cut-off hand in character view. */
   setCharacter(root: Object3D | null) {
     if (this.character) this.scene.remove(this.character);
+    if (this.characterBones) {
+      this.scene.remove(this.characterBones);
+      this.characterBones.dispose();
+      this.characterBones = null;
+    }
     this.character = root;
     if (root) {
       root.visible = false;
       this.scene.add(root);
+      // Every bone the skin is bound to, so a twisted wrist shows whether the bone or the weighting is at fault.
+      let skinned = false;
+      root.traverse((o) => { if ((o as { isBone?: boolean }).isBone) skinned = true; });
+      if (skinned) {
+        const helper = new SkeletonHelper(root);
+        const mat = helper.material as LineBasicMaterial;
+        mat.depthTest = false;
+        mat.depthWrite = false;
+        mat.transparent = true;
+        helper.renderOrder = 14;
+        helper.frustumCulled = false;
+        helper.visible = false;
+        this.characterBones = helper;
+        this.scene.add(helper);
+      }
     }
     this.setCharacterView(false);
   }
@@ -592,6 +615,27 @@ export class Viewer {
     if (this.fit) this.fit.visible = this.view.fit && !cv;
     if (this.boneLines) this.boneLines.visible = this.view.bones && !cv;
     if (this.jointDots) this.jointDots.visible = this.view.bones && !cv;
+    if (this.characterBones) this.characterBones.visible = this.view.bones && cv;
+    // the whole character goes see-through with its bones on, so they read inside the arm
+    if (this.character) {
+      const ghost = this.view.bones && cv;
+      this.character.traverse((o) => {
+        const mesh = o as Mesh;
+        if (!mesh.isMesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const mat of mats) {
+          if (mat.userData.baseOpacity === undefined) {
+            mat.userData.baseOpacity = mat.opacity;
+            mat.userData.baseTransparent = mat.transparent;
+            mat.userData.baseDepthWrite = mat.depthWrite;
+          }
+          mat.transparent = ghost ? true : mat.userData.baseTransparent;
+          mat.opacity = ghost ? Math.min(mat.userData.baseOpacity, 0.45) : mat.userData.baseOpacity;
+          mat.depthWrite = ghost ? false : mat.userData.baseDepthWrite;
+          mat.needsUpdate = true;
+        }
+      });
+    }
     if (this.contactDots) this.contactDots.visible = this.view.contacts;
     // let the fit and bones show through the skin
     if (this.hand) {
