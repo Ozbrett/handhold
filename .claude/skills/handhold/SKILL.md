@@ -94,6 +94,31 @@ When the manifest has `hinges`, the run prints a `HINGES` line: `joints` should 
 
 Check the `--shots` close-ups (`<pose>_<frame>_<side>-a/b.png`) against the `--compare` shots of the game's own hold. In the summary, read `segments`, `triggerMiss` (mm) and `moved` (mm).
 
+## Checking a hold or a motion before it is used
+
+A hold or clip is not done until it is checked, looked at, and approved. Three commands, all headless:
+
+```bash
+node scripts/hold-check.mjs --character <fbx|glb> --item <obj> --name <name> --out <dir> --hand right=<pose.json>[;grip=<Piece,...>] [--hand left=<pose.json>]
+node scripts/motion-check.mjs --motion <motion.json> --out <dir>
+node scripts/review.mjs status|approve|reject <dir> [<name> --note "<what the sheet shows>"]
+```
+
+Answer these in order, for every item in `<dir>/review.json`. Stop at the first "no": reject it with a note that says what is wrong, and fix the hold, not the check.
+
+1. **Machine checks.** Do the `FAIL` lines say nothing failed? A failing item cannot be approved. For each failure, name the joint, the value and the limit in the reply.
+2. **The sheet** (`<dir>/<name>/sheet.png`; downscale it if it is wider than about 2000 px). Look at every view (front, left, right, back, above, eye; for a clip, every moment):
+   - Is each hand on the part it should be on: the palm against the grip, the fingers round it, the thumb on its own side, nothing floating, nothing sunk in?
+   - Is the item the right way up and pointing where it should (a gun's top up, its muzzle away from the body)?
+   - Is anything red? Red is skin inside an item, or skin torn or folded.
+   - Do the elbows point out and down, away from the body, never in through the chest?
+   - Is any part of the item inside the head, chest or arms?
+   - For a clip: does the holding hand stay put on the grip while the other hand works? Do the first and last moments match the hold?
+3. **Does the picture agree with the checks?** If the picture shows a fault while the checks pass, the check is wrong: say so and fix the check before anything else. Never approve over it.
+4. **Approve** only when 1 to 3 are all yes: `review.mjs approve <dir> <name> --note "<what you saw>"`. The note says what the sheet showed, not that it "looks fine".
+
+`handhold.mjs --review <dir>` exits 3 while anything there is pending, rejected or failing; `--unreviewed` takes the exports without a review. An item whose inputs or checks change goes back to pending by itself.
+
 ## Rules
 
 - Never open the app, a browser window, Unity, Blender or Godot on screen. The CLI is headless; the engine checks are in `docs/development.md` under "Checking the exports inside the engines" and run with `-batchmode -nographics` / `-b`.

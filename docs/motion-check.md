@@ -101,4 +101,4 @@ The same whole-pose checks Handhold runs on its own poses ([how-it-works.md](how
 }
 ```
 
-`node scripts/review.mjs approve|reject <name> --note "..." --dir <out>` records the verdict after the sheet has been looked at ([with-claude.md](with-claude.md)).
+`node scripts/review.mjs approve|reject <out> <name> --note "..."` records the verdict after the sheet has been looked at ([with-claude.md](with-claude.md)).

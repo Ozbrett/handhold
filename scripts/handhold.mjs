@@ -38,12 +38,19 @@
  *   --out <folder>       where to write everything. Default handhold-out/<hand>-<object>
  *   --name <name>        file name prefix. Default grip
  *
+ * Review
+ *   --review <folder>    the review.json folder (scripts/hold-check.mjs, scripts/motion-check.mjs) that covers these
+ *                        holds. The exports are written either way, but they are not final until every item there is
+ *                        approved: the exit code is 3 while anything there is pending, rejected or failing, or when no
+ *                        review is given
+ *   --unreviewed         take the exports without a review: only a grip that does not hold fails the run
+ *
  * --hand sample uses the built-in player (a rigged mannequin); --object sample:hammer
  * (or stick, box, ball, mug) uses a built-in prop.
  *
  * Writes the posed .glb, the .pose.json, the Unity / Godot / Blender
  * packages, screenshots, and summary.json (what was found, whether each grip
- * holds, what the wrist and the second hand did). Exits 1 if no grip holds.
+ * holds, what the wrist and the second hand did). Exits 1 if no grip holds, 3 if the holds are not yet reviewed (see Review).
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
@@ -250,14 +257,35 @@ console.log(`\nSUMMARY ${join(out, 'summary.json')}: ${grips.length} grips, ${su
   (summary.secondHand ? `; second hand: ${summary.secondHand}` : '') +
   `; exports: ${Object.values(summary.exports).filter(Boolean).length} of 5` +
   (summary.animations.length ? `; animations: ${summary.animations.map((a) => a.name).join(', ')}` : ''));
-process.exit(code === 0 && summary.holds && summary.problems.length === 0 ? 0 : 1);
+if (!(code === 0 && summary.holds && summary.problems.length === 0)) process.exit(1);
+if (!args.unreviewed) {
+  const left = await reviewLeft(args.review);
+  if (left.length) {
+    console.log(`not final (review, or pass --unreviewed):
+  ${left.join('
+  ')}`);
+    process.exit(3);
+  }
+}
+process.exit(0);
+
+/** What the review still holds up; a missing review holds up everything. */
+async function reviewLeft(dir) {
+  if (!dir || dir === true) return ['no --review folder given: check the holds with scripts/hold-check.mjs and review them with scripts/review.mjs'];
+  const path = resolve(dir, 'review.json');
+  if (!existsSync(path)) return [`no ${path}`];
+  const { importTs } = await import('./lib/ts.mjs');
+  const R = await importTs('src/check/review.ts');
+  const r = R.readReview(path);
+  return r.items.length ? R.blocking(r) : [`${path} has nothing in it`];
+}
 
 function readUsage() {
   return `usage: node scripts/handhold.mjs --hand <file> --object <file> [--grip fx,fy,fz] [--size n] [--pick 0|1|left|right]
        [--second fx,fy,fz] [--arm none|hold|sweep] [--hold f,u,o] [--sweep-to f,u,o] [--turn t,y,r]
        [--mode animation|hold|camera] [--style everyday|tool|weapon] [--clips idle,walk,use,...]
        [--poses Held/Raised:0.4,0.3,0.1] [--look [Name]] [--look-range up,down,left,right]
-       [--out folder] [--name name] [--build]
+       [--out folder] [--name name] [--build] [--review folder | --unreviewed]
 --hand sample uses the built-in rigged player; --object sample:hammer (stick, box, ball, mug) a built-in prop.
 See the comment at the top of scripts/handhold.mjs for what each option does.`;
 }
