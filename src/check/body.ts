@@ -74,6 +74,8 @@ export interface Body {
   thickness: number[];
   /** Height of the character (metres), from the rest skin. */
   height: number;
+  /** The region each bone's skin belongs to. */
+  boneRegion: Map<Bone, Region>;
 }
 
 export const key = (n: string) => n.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -81,7 +83,7 @@ export const key = (n: string) => n.toLowerCase().replace(/[^a-z0-9]/g, '');
 const isBone = (o: Object3D | null | undefined): o is Bone => !!o && (o as Bone).isBone === true;
 const boneKids = (b: Bone) => b.children.filter(isBone);
 const count = (b: Bone): number => boneKids(b).reduce((n, c) => n + 1 + count(c), 0);
-const mainChild = (b: Bone) => boneKids(b).sort((x, y) => count(y) - count(x))[0] ?? null;
+export const mainChild = (b: Bone): Bone | null => boneKids(b).sort((x, y) => count(y) - count(x))[0] ?? null;
 
 /** Left or right from a bone's name: a trailing r / l token, or the words. */
 export function sideOf(name: string): Side | null {
@@ -271,7 +273,7 @@ export function buildBody(root: Object3D): Body | null {
 
   let lo = Infinity, hi = -Infinity;
   for (const s of skin) for (let i = 1; i < s.rest.length; i += 3) { lo = Math.min(lo, s.rest[i]); hi = Math.max(hi, s.rest[i]); }
-  const body: Body = { root, bones, limbs, spine, neck, head, pelvis, skin, restWorld, restLocal, forward, up, thickness: [], height: hi - lo };
+  const body: Body = { root, bones, limbs, spine, neck, head, pelvis, skin, restWorld, restLocal, forward, up, thickness: [], height: hi - lo, boneRegion: regionOf };
   body.thickness = regionThickness(body);
   return body;
 }
