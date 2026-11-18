@@ -473,6 +473,56 @@ except Exception as e:
     failures.append(f'two meshes, fixed: {e!r}')
     print(f'[test_rig_check] FAIL two meshes, fixed: {e!r}', flush=True)
 
+# a cuff: a second piece whose points sit on the arm's skin round the elbow, weighted as the skin under it. Smoothing the arm works
+# along the arm's edges and must not leave the cuff's points weighted apart from the skin they sit on, or it opens there
+def seam_split(fixed):
+    arm, body = build(rigid=True)
+    rep = run(arm, body)
+    row = max(rep['joints'], key=lambda r: r['stretch_max'])
+    head = np.array(tuple(arm.matrix_world @ arm.data.bones[row['bone']].head_local))
+    bm = bmesh.new()
+    bm.from_mesh(body.data)
+    far = [v for v in bm.verts if np.linalg.norm(np.array(tuple(v.co)) - head) > 2.0 * row['radius_cm'] / 100]
+    bmesh.ops.delete(bm, geom=far, context='VERTS')
+    if bm.verts.layers.deform.active:
+        bm.verts.layers.deform.remove(bm.verts.layers.deform.active)
+    cuff = bpy.data.objects.new('cuff', bpy.data.meshes.new('cuff'))
+    bpy.context.scene.collection.objects.link(cuff)
+    bm.to_mesh(cuff.data)
+    bm.free()
+    bco = np.array([tuple(v.co) for v in body.data.vertices])
+    pairs = []
+    for v in cuff.data.vertices:
+        i = int(np.linalg.norm(bco - np.array(tuple(v.co)), axis=1).argmin())
+        pairs.append((v.index, i))
+        set_w(cuff, v.index, {body.vertex_groups[g.group].name: g.weight for g in body.data.vertices[i].groups})
+    cuff.modifiers.new('arm', 'ARMATURE').object = arm
+    bpy.context.view_layer.update()
+    if fixed:
+        rc.fix(rc.Model(arm, [body, cuff]), {'smooth': True}, rep['joints'])
+
+    def w(o, i):
+        d = {o.vertex_groups[g.group].name: g.weight for g in o.data.vertices[i].groups}
+        t = sum(d.values()) or 1.0
+        return {n: x / t for n, x in d.items()}
+    worst = 0.0
+    for c, i in pairs:
+        a, b = w(cuff, c), w(body, i)
+        worst = max(worst, sum(abs(a.get(n, 0.0) - b.get(n, 0.0)) for n in set(a) | set(b)))
+    return worst, len(pairs)
+
+
+for fixed in (False, True):
+    try:
+        worst, n = seam_split(fixed)
+        ok = worst < 1e-3 and n > 0
+        line = f'{"ok  " if ok else "FAIL"} a cuff on the elbow{", smoothed" if fixed else ""}: {n} points, weights apart by {worst:.3f} at worst (want 0)'
+    except Exception as e:
+        ok, line = False, f'FAIL a cuff on the elbow{", smoothed" if fixed else ""}: {e!r}'
+    print('[test_rig_check] ' + line, flush=True)
+    if not ok:
+        failures.append(line)
+
 # a vertex whose neighbours are all on a bone far from it keeps its own weights when they are averaged, not the far bone
 S = np.array([[0.0, 1.0], [0.5, 0.5]])
 ok = np.array([[True, False], [True, True]])
@@ -481,6 +531,20 @@ line = f'held to near bones: {got.tolist()} (want [[1, 0], [0.5, 0.5]])'
 print('[test_rig_check] ' + ('ok   ' if np.allclose(got, [[1, 0], [0.5, 0.5]]) else 'FAIL ') + line, flush=True)
 if not np.allclose(got, [[1, 0], [0.5, 0.5]]):
     failures.append(line)
+
+# the left arm and leg weighted with a hard step at every joint, the right with a smooth blend: the sides differ, and --mirror
+# gives each mirrored pair the average of the two
+arm, body = build(rigid=True)
+rigid = [{body.vertex_groups[g.group].name: g.weight for g in v.groups} for v in body.data.vertices]
+arm, body = build()
+for v in body.data.vertices:
+    if v.co.x > 0.04:
+        set_w(body, v.index, rigid[v.index])
+expect('the left rigid, the right smooth', run(arm, body), 'mirror_weights', ('warn', 'fail'))
+rc.fix(rc.Model(arm, [body]), {'mirror': True}, [], 'humanoid')
+rep = run(arm, body)
+expect('the left rigid, the right smooth, mirrored', rep, 'mirror_weights', 'pass')
+expect('the left rigid, the right smooth, mirrored', rep, 'far', 'pass')
 
 # a creature: no humanoid names, still checked for weights and stress
 arm, body = build(names={n: f'bone_{i}' for i, n in enumerate(BONES)})

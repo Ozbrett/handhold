@@ -52,6 +52,7 @@ fix only (each a step; with none named, all of them run), then everything is che
                          faded over to the limb's own bones
   --smooth               a joint whose turn tears the skin (a hard step in the weights): the weights round it are averaged until the
                          blend is about 0.6 of the limb's radius wide each side
+  --mirror               a humanoid's mirrored points (as the mirror check pairs them, in one mesh) both take the average of the two
   (always, last)         every vertex is kept to its 4 strongest bones and its weights add to 1
   --save <file.blend>    save the fixed scene
   --export <file>        also export it (.fbx or .glb); FBX keeps the scene's actions, with no leaf bones
@@ -71,7 +72,7 @@ from mathutils import Quaternion, Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.kdtree import KDTree
 
-FIX_STEPS = ('unweighted', 'far', 'spikes', 'orphans', 'leaks', 'limbs', 'smooth')
+FIX_STEPS = ('unweighted', 'far', 'spikes', 'orphans', 'leaks', 'limbs', 'smooth', 'mirror')
 
 # a person's limb lengths as a share of their height (bone head to its child's head), wide enough for a stylised character
 LENGTHS = {'upperarm': (0.11, 0.24), 'lowerarm': (0.09, 0.22), 'thigh': (0.16, 0.32), 'calf': (0.15, 0.32)}
@@ -623,21 +624,28 @@ def weight_checks(M, kind):
     return out
 
 
-def weight_mirror(M):
+def mirror_plane(M):
+    """Each bone's other side (itself for a middle bone) and the mirror plane's x. The plane is the skeleton's middle along x (the
+    body is imported standing with its sides along x): the heads of the bones with no other side. The skin's own median is not: a
+    pouch, a holster or a sleeve on one side moves it off the middle, and every point is then compared with a point beside its true
+    twin."""
     names = set(M.bone_names)
     swap = np.arange(len(M.bone_names))
     for i, n in enumerate(M.bone_names):
         m = mirror_name(n, names)
         if m:
             swap[i] = M.bidx[m]
+    centre = [i for i in range(len(M.bone_names)) if swap[i] == i]
+    allco = np.concatenate([M.co[o.name] for o in M.meshes])
+    mid = float(np.median(M.head[centre, 0])) if centre and len(centre) < len(M.bone_names) else float(np.median(allco[:, 0]))
+    return swap, mid
+
+
+def weight_mirror(M):
+    swap, mid = mirror_plane(M)
     worst, matched, differ = 0.0, 0, 0
     allco = np.concatenate([M.co[o.name] for o in M.meshes])
     allW = np.concatenate([M.W[o.name] for o in M.meshes])
-    # the mirror plane is the skeleton's middle along x (the body is imported standing with its sides along x): the heads of the
-    # bones with no other side. The skin's own median is not: a pouch, a holster or a sleeve on one side moves it off the middle,
-    # and every point is then compared with a point beside its true twin
-    centre = [i for i in range(len(M.bone_names)) if swap[i] == i]
-    mid = float(np.median(M.head[centre, 0])) if centre and len(centre) < len(M.bone_names) else float(np.median(allco[:, 0]))
     kd = KDTree(len(allco))
     for i, p in enumerate(allco):
         kd.insert(p, i)
@@ -661,7 +669,7 @@ def weight_mirror(M):
     st = 'pass' if matched < 50 or share < 0.03 else 'warn' if share < 0.15 else 'fail'
     value = f'{share * 100:.0f}% of {matched} mirrored points weighted unlike their other side' if matched >= 50 else 'the mesh is not mirrored: not compared'
     return {'key': 'mirror_weights', 'title': 'The left weighted like the right', 'status': st, 'value': value,
-            'fix': '' if st == 'pass' else 'Mirror the weights from the better side (Blender: Weights > Mirror, with the topology mirrored).'}
+            'fix': '' if st == 'pass' else 'rig-check fix --mirror gives each mirrored pair the average of the two (Blender: Weights > Mirror from the better side).'}
 
 
 # ----------------------------------------------------------------------------- stress
@@ -937,6 +945,38 @@ def follow_limbs(M, o, W, rows):
     return changed
 
 
+def mirror_weights(M, o, W):
+    """Each vertex whose mirror point is within the mirror check's distance of a vertex of the same mesh, and that vertex, both take
+    the average of their weights, the twin's with left and right swapped: the two sides end weighted alike where the mesh is
+    mirrored, and where it is not (a pouch, a sleeve cut on one side) nothing changes. Returns the vertices changed."""
+    changed = np.zeros(len(W), bool)
+    swap, mid = mirror_plane(M)
+    if (swap == np.arange(len(swap))).all():
+        return changed
+    co = M.co[o.name]
+    tol = 0.004 * M.size
+    kd = KDTree(len(co))
+    for i, p in enumerate(co):
+        kd.insert(p, i)
+    kd.balance()
+    pi, pj = [], []
+    for i in np.where(co[:, 0] - mid > tol)[0]:
+        p = co[i]
+        _, j, d = kd.find((2 * mid - p[0], p[1], p[2]))
+        if d is not None and d <= tol and j != i:
+            pi.append(int(i))
+            pj.append(int(j))
+    if not pi:
+        return changed
+    pi, pj = np.array(pi), np.array(pj)
+    A = 0.5 * (W[pi] + W[pj][:, swap])
+    W[pi] = A
+    W[pj] = A[:, swap]
+    changed[pi] = True
+    changed[pj] = True
+    return changed
+
+
 def smooth_joints(M, o, W, rows):
     """A hard step in the weights at a joint (the stretch the stress pass fails): the weights round it are averaged over the mesh's
     edges until the blend is about 0.6 of the limb's radius wide each side, fully within 2 radii of the joint and fading out by 3,
@@ -974,15 +1014,72 @@ def smooth_joints(M, o, W, rows):
     return changed
 
 
-def fix(M, opt, rows=None):
+def keep_seams(M, before, changes):
+    """Points that sit together (a split in one mesh, or the rim of one piece on another) and moved as one before the fix get the
+    average of their new weights: every step works on one mesh along its edges, and two points that share no edge would otherwise
+    come out weighted apart and the skin open between them. Points that were apart before are left apart. Returns the points
+    changed."""
+    refs, pts = [], []
+    for o in M.meshes:
+        for k, p in enumerate(M.co[o.name]):
+            refs.append((o.name, k))
+            pts.append(p)
+    if len(pts) < 2:
+        return 0
+
+    def unit(w):
+        t = w.sum()
+        return w / t if t > 1e-9 else w
+    kd = KDTree(len(pts))
+    for k, p in enumerate(pts):
+        kd.insert(p, k)
+    kd.balance()
+    parent = list(range(len(pts)))
+
+    def root(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    tol = 0.0003 * M.size
+    for k, p in enumerate(pts):
+        nk, ik = refs[k]
+        for (_, j, _d) in kd.find_range(p, tol):
+            if j <= k:
+                continue
+            nj, ij = refs[j]
+            if np.abs(unit(before[nk][ik]) - unit(before[nj][ij])).sum() > 1e-3:
+                continue
+            if np.abs(unit(M.W[nk][ik]) - unit(M.W[nj][ij])).sum() > 1e-6:
+                parent[root(j)] = root(k)
+    groups = {}
+    for k in range(len(pts)):
+        groups.setdefault(root(k), []).append(k)
+    n = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        avg = sum(unit(M.W[refs[k][0]][refs[k][1]]) for k in members) / len(members)
+        for k in members:
+            nk, ik = refs[k]
+            M.W[nk][ik] = avg
+            changes[nk][ik] = True
+            n += 1
+    return n
+
+
+def fix(M, opt, rows=None, kind='humanoid'):
     """rows: the stress pass's joints (the report's 'joints'), which the leaks, limbs and smooth steps work from; without them those steps
     do nothing."""
     steps = {s for s in FIX_STEPS if opt.get(s)} or set(FIX_STEPS)
     done = {}
     rows = rows or []
+    before = {o.name: M.W[o.name].copy() for o in M.meshes}
+    changes = {}
     for o in M.meshes:
         W = M.W[o.name]
         changed = np.zeros(len(W), bool)
+        changes[o.name] = changed
         if 'far' in steps:
             # every weight on a far bone, however small: one left behind grows past the far check's share when the rest is
             # normalised. Not on a bone above the vertex's own: that is a body riding its root
@@ -1023,6 +1120,16 @@ def fix(M, opt, rows=None):
             c = smooth_joints(M, o, W, rows)
             changed |= c
             done['smooth'] = done.get('smooth', 0) + int(c.sum())
+        if 'mirror' in steps and kind == 'humanoid':
+            c = mirror_weights(M, o, W)
+            changed |= c
+            done['mirror'] = done.get('mirror', 0) + int(c.sum())
+    n = keep_seams(M, before, changes)
+    if n:
+        done['seams kept'] = n
+    for o in M.meshes:
+        W = M.W[o.name]
+        changed = changes[o.name]
         # always: the 4 strongest, adding to 1
         over = (W > 0).sum(1) > 4
         if over.any():
@@ -1098,7 +1205,7 @@ def main():
     M, rep = run_checks(arm, meshes, opt)
     if opt['cmd'] == 'fix':
         before = rep
-        done = fix(M, opt, rep['joints'])
+        done = fix(M, opt, rep['joints'], rep['kind'])
         log('fixed: ' + (', '.join(f'{k} {v}' for k, v in done.items()) or 'nothing to fix'))
         M, rep = run_checks(arm, meshes, opt)
         rep['before'] = {'score': before['score'], 'pass': before['pass']}

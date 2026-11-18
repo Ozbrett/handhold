@@ -13,7 +13,7 @@ node scripts/rig-check.mjs check <model> [--report <file.json>] [--ranges <file.
 ```
 
 ```bash
-node scripts/rig-check.mjs fix <model> [--unweighted] [--far] [--spikes] [--orphans] [--leaks] [--limbs] [--smooth] [--save <fixed.blend>] [--export <fixed.fbx|.glb>]
+node scripts/rig-check.mjs fix <model> [--unweighted] [--far] [--spikes] [--orphans] [--leaks] [--limbs] [--smooth] [--mirror] [--save <fixed.blend>] [--export <fixed.fbx|.glb>]
 ```
 
 `<model>` is a `.fbx`, `.glb`, `.gltf` or `.blend`. Blender is found at `$BLENDER`, or the newest one in the usual install folder.
@@ -80,6 +80,8 @@ With no step named, `fix` runs all of them, then checks everything again and rep
 | `--leaks` | a joint that drags skin far from it: its weight, and its children's, is faded out of that skin and given to the bones near it that do not turn with it |
 | `--limbs` | a joint that leaves skin on its limb behind: that skin's weight on bones outside the limb is faded over to the limb's own bones |
 | `--smooth` | a joint that tears: the weights round it are averaged until the blend is about 0.6 of the limb's radius wide each side |
+| `--mirror` | a humanoid's mirrored points (as the mirror weights check pairs them, within one mesh) both take the average of the two, left and right swapped |
+| always | points that sit together (a split in one mesh, a piece's rim on another) and moved as one before the fix get one shared set of weights again: every step works along one mesh's edges, and would otherwise open the skin between them |
 | always, last | every vertex is kept to its 4 strongest bones and its weights add to 1 |
 
 `--leaks`, `--limbs` and `--smooth` work from the joints the check before them failed. Every averaging keeps each vertex to the
@@ -101,7 +103,7 @@ builds a humanoid of tubes with sound weights, which must pass every check, then
 the check that is for it to catch it (and `fix` to mend it, where it mends that fault): rigid weights tear, unweighted, far and
 spiked vertices, five bones on a vertex, an elbow out in the air, a forearm that does not point at its hand, a missing neck, an
 arm 12 cm out of mirror, forearm skin on the spine, a wrist on an open seam, the neck leaking to the belly, a coarse limb smoothed
-wide, a pouch on one hip, a model of two meshes, the same body under Mixamo, Blender and Rigify names, and a creature with no names
+wide, a pouch on one hip, one side rigid and the other smooth, a model of two meshes, a cuff on the elbow kept shut when the arm is smoothed, the same body under Mixamo, Blender and Rigify names, and a creature with no names
 at all.
 
 ## With Rig Doctor and Handhold
