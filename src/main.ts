@@ -370,7 +370,17 @@ function settle(g: Grasp, rig: RiggedHand | undefined = hand?.rig): Grasp {
     const relaxed = new Set(placed.relax.map((n) => n.toLowerCase()));
     rig.model.fingers.forEach((f, i) => relaxed.has(f.name.toLowerCase()) && keep.push(i));
   }
-  const result = guardFor(rig, object.grasp).clear(from.wrist, angles, { keep });
+  const guard = guardFor(rig, object.grasp);
+  let result = guard.clear(from.wrist, angles, { keep });
+  // the hand moved out of the part takes the pinned fingertip off its point: reach for it again from there, and keep the skin out again
+  for (let i = 0; i < 2 && main && pin && result.moved > 0.0005; i++) {
+    const target = pin.point.clone().applyMatrix4(result.wrist.clone().invert());
+    const r = reachFingertip(rig.model, result.angles, pin.finger, target);
+    const again = guard.clear(result.wrist, r.angles, { keep });
+    if (!again.clear && result.clear) break;
+    ui.pinMiss = r.miss / rig.model.size;
+    result = { ...again, before: result.before, moved: result.moved + again.moved, changes: [...result.changes, ...again.changes] };
+  }
   g.wrist.copy(result.wrist);
   g.angles = result.angles;
   settledFrom.set(g, { key, wrist: from.wrist, angles: from.angles, result });

@@ -474,7 +474,9 @@ export class SkinGuard {
     const tol = options.tol ?? 0.001;
     const contact = options.contact ?? 0.002;
     const keep = new Set(options.keep ?? []);
-    const maxMove = options.maxMove ?? 0.3 * model.size;
+    // the least move out is found within a third of the hand's size first; only a grip still in after that may go out as far as half of it
+    const reaches = options.maxMove !== undefined ? [options.maxMove] : [0.3 * model.size, 0.5 * model.size];
+    let maxMove = reaches[0];
     const before = this.measure(wrist0, angles0);
     let wrist = wrist0.clone();
     const changes: string[] = [];
@@ -526,9 +528,10 @@ export class SkinGuard {
       }
       return { out: true, t: hi, result: good };
     };
-    for (let tries = 0; tries < 4 && best.left.length; tries++) {
+    for (let tries = 0; tries < 4 * reaches.length && best.left.length; tries++) {
+      maxMove = reaches[Math.floor(tries / 4)];
       // twice from the grip's own fingers, then from open fingers
-      const from = tries < 2 ? angles0 : opened;
+      const from = tries % 4 < 2 ? angles0 : opened;
       const room = maxMove - moved;
       if (room <= 0) break;
       // two ways out: against what is in (the faces it is in say which way is out), and back off the palm; the shorter one wins
@@ -538,19 +541,28 @@ export class SkinGuard {
       if (pushed.lengthSq() > 1e-12) ways.push(pushed.normalize());
       const back = model.frame.normal.clone().transformDirection(wrist).negate();
       if (!ways.length || ways[0].dot(back) < 0.98) ways.push(back);
-      let pick: ReturnType<typeof search> | null = null;
-      for (const way of ways) {
-        const r = search(way, from, room);
-        const better = !pick || (r.out && (!pick.out || r.t < pick.t)) || (!r.out && !pick.out && r.result.sum < pick.result.sum);
-        if (better) pick = { ...r, way } as ReturnType<typeof search> & { way: Vector3 };
+      type Found = ReturnType<typeof search> & { way: Vector3 };
+      let pick: Found | null = null as Found | null;
+      const tryWays = (list: Vector3[]) => {
+        for (const way of list) {
+          const r = search(way, from, room);
+          const better = !pick || (r.out && (!pick.out || r.t < pick.t)) || (!r.out && !pick.out && r.result.sum < pick.result.sum);
+          if (better) pick = { ...r, way };
+        }
+      };
+      tryWays(ways);
+      // a finger caught round a block may come free only sideways or along the hand: the hand's own four other ways, when neither of those freed it
+      if (!pick?.out) {
+        const side = model.frame.side.clone().transformDirection(wrist), up = model.frame.up.clone().transformDirection(wrist);
+        tryWays([side, side.clone().negate(), up, up.clone().negate()]);
       }
-      const chosen = pick as ReturnType<typeof search> & { way: Vector3 };
+      const chosen = pick as Found;
       if (chosen.out || chosen.t > 0) {
         // not out along either way: go where the least was left in, and look again from there
         wrist = shifted(wrist, chosen.way, chosen.t);
         moved += chosen.t;
         best = chosen.result;
-      } else if (tries >= 1) break;
+      } else if (tries % 4 >= 1) tries = 4 * Math.floor(tries / 4) + 3;
     }
     const angles = best.angles;
     changes.push(...best.said);
@@ -575,7 +587,9 @@ export class SkinGuard {
           const dof = joint.dofs[d];
           const at = joint.dofStart + d;
           const a0 = angles[at];
-          const targets = [Math.max(dof.min, Math.min(dof.max, dof.open ?? 0)), dof.min, dof.max].filter((t, i, all) => Math.abs(t - a0) > 1e-4 && all.indexOf(t) === i);
+          // open, the two ends, then between: a thumb round a block may clear only part way through its range
+          const between = [1, 2, 3, 4, 5].map((i) => dof.min + ((dof.max - dof.min) * i) / 6);
+          const targets = [Math.max(dof.min, Math.min(dof.max, dof.open ?? 0)), dof.min, dof.max, ...between.sort((x, y) => Math.abs(x - a0) - Math.abs(y - a0))].filter((t, i, all) => Math.abs(t - a0) > 1e-4 && all.indexOf(t) === i);
           let best = { depth, to: a0 };
           let cleared = false;
           for (const t of targets) {
