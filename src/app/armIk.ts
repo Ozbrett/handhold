@@ -72,6 +72,12 @@ export interface ArmRig {
   baseTurn: Quaternion;
   /** How far this arm may turn (setBodyLimits changes it). */
   limits: BodyLimits;
+  /** The collarbone above the upper arm, when the rig has one: turned (up to `clavicleReach` degrees) only when the wrist cannot reach otherwise. */
+  clavicle?: Bone | null;
+  clavicleRest?: Quaternion;
+  clavicleReach?: number;
+  /** The body the elbow and forearm keep out of: the swivel that keeps them clear wins over one that bends the wrist less. */
+  avoid?: Capsule[];
 }
 
 export interface WristJoint {
@@ -115,6 +121,19 @@ export interface WristReport {
   elbow: number;
   /** How far the object ends up from the turn asked for, when the joints run out of range. */
   miss: number;
+  /** How far (metres) the wrist is short of where the hold put it: more than 0 means the target is out of reach, and the hand is shown at the nearest place it does reach, not on the target. */
+  short?: number;
+  /** How deep (metres) the arm ends up in the body it was told to keep clear of (`ArmRig.avoid`). */
+  overlap?: number;
+  /** How far (degrees) the collarbone was turned to reach. */
+  clavicle?: number;
+}
+
+/** A round-ended rod the arm keeps out of (a chest, a head), in the model's space. */
+export interface Capsule {
+  a: Vector3;
+  b: Vector3;
+  radius: number;
 }
 
 const _p = new Vector3(), _s = new Vector3();
@@ -182,7 +201,10 @@ export function buildArmRig(char: CharacterRig, palm?: PalmAtRest): ArmRig | nul
     joint: wristJoint(shoulder, elbow, wrist, forward, palm),
     baseTurn: new Quaternion(),
     limits: { ...BODY_LIMITS },
+    clavicle: (upper.parent as Bone | null)?.isBone && /clav|shoulder/i.test(upper.parent!.name) && !/spine|chest|neck/i.test(upper.parent!.name) ? (upper.parent as Bone) : null,
+    clavicleReach: 20,
   };
+  arm.clavicleRest = arm.clavicle?.quaternion.clone();
   arm.baseTurn.copy(armAt(arm, clampToReach(arm, defaultHold(arm).position), 0).fore);
   return arm;
 }
@@ -369,13 +391,41 @@ function limitWrist(j: WristJoint, want: Quaternion, L: BodyLimits): { q: Quater
  */
 export function solveArm(arm: ArmRig, hold: HoldPose | null, report?: WristReport): Matrix4 {
   const bones = [arm.upper, arm.fore, arm.hand];
+  if (arm.clavicle && arm.clavicleRest) {
+    arm.clavicle.quaternion.copy(arm.clavicleRest);
+    arm.clavicle.updateMatrixWorld(true);
+  }
   if (!hold) {
     bones.forEach((b, i) => b.quaternion.copy(arm.restLocal[i]));
     arm.upper.updateMatrixWorld(true);
-    if (report) Object.assign(report, { flex: 0, radial: 0, twist: 0, elbow: 0, miss: 0 });
+    if (report) Object.assign(report, { flex: 0, radial: 0, twist: 0, elbow: 0, miss: 0, short: 0, overlap: 0, clavicle: 0 });
     return arm.hand.matrixWorld.clone();
   }
+  // out of reach: the collarbone brings the shoulder up to clavicleReach degrees towards the target before the wrist falls short
+  const restShoulder = arm.shoulder;
+  let clavicleTurn = 0;
+  if (arm.clavicle && arm.clavicleRest && hold.position.distanceTo(arm.shoulder) > reachOf(arm).max) {
+    const pivot = arm.clavicle.getWorldPosition(new Vector3());
+    const arm0 = arm.shoulder.clone().sub(pivot);
+    const want0 = hold.position.clone().sub(pivot);
+    const axis = new Vector3().crossVectors(arm0, want0);
+    if (axis.lengthSq() > 1e-12) {
+      axis.normalize();
+      const max = reachOf(arm).max;
+      const reachAt = (deg: number) => hold.position.distanceTo(pivot.clone().add(arm0.clone().applyAxisAngle(axis, deg * DEG)));
+      // the least turn that brings the target within reach, or the most allowed
+      let lo = 0, hi = Math.min(arm.clavicleReach ?? 20, arm0.angleTo(want0) / DEG);
+      if (reachAt(hi) <= max) for (let k = 0; k < 20; k++) { const m = (lo + hi) / 2; if (reachAt(m) > max) lo = m; else hi = m; }
+      clavicleTurn = hi;
+      const parentQ = arm.clavicle.parent ? worldQuat(arm.clavicle.parent) : new Quaternion();
+      const world = new Quaternion().setFromAxisAngle(axis, clavicleTurn * DEG).multiply(parentQ.clone().multiply(arm.clavicleRest));
+      arm.clavicle.quaternion.copy(parentQ.invert().multiply(world));
+      arm.clavicle.updateMatrixWorld(true);
+      arm.shoulder = arm.upper.getWorldPosition(new Vector3());
+    }
+  }
   const target = clampToReach(arm, hold.position);
+  const short = target.distanceTo(hold.position);
   const want = hold.handTurn ? hold.handTurn.clone() : wantedTurn(arm, hold.turn);
 
   const tryAt = (swivel: number) => {
@@ -383,8 +433,10 @@ export function solveArm(arm: ArmRig, hold: HoldPose | null, report?: WristRepor
     const wrist = limitWrist(arm.joint, pose.fore.clone().invert().multiply(want), arm.limits);
     // the elbow swinging out costs more the nearer it gets to its own limit (more so with soft ends)
     const out = Math.abs(swivel) / Math.max(1, arm.limits.swivel);
-    const cost = wrist.miss + 0.3 * Math.abs(swivel) + 20 * arm.limits.soft * out ** 4 + 0.02 * (Math.abs(wrist.flex) + Math.abs(wrist.radial) + Math.abs(wrist.twist));
-    return { swivel, pose, wrist, cost };
+    const overlap = arm.avoid?.length ? armInside(arm, pose.elbow, target, arm.avoid) : 0;
+    // a centimetre in the body costs more than any wrist bend: a pose through the chest is never the answer while one clear of it exists
+    const cost = wrist.miss + 0.3 * Math.abs(swivel) + 20 * arm.limits.soft * out ** 4 + 0.02 * (Math.abs(wrist.flex) + Math.abs(wrist.radial) + Math.abs(wrist.twist)) + 1e5 * overlap;
+    return { swivel, pose, wrist, cost, overlap };
   };
   let best = tryAt(0);
   const maxSwivel = Math.max(0, arm.limits.swivel);
@@ -413,9 +465,30 @@ export function solveArm(arm: ArmRig, hold: HoldPose | null, report?: WristRepor
   if (report) {
     const natural = armAt(arm, target, 0).elbow;
     const raised = best.swivel === 0 ? 0 : Math.sign(pose.elbow.y - natural.y || 1) * Math.abs(best.swivel);
-    Object.assign(report, { flex: wrist.flex, radial: wrist.radial, twist: wrist.twist, elbow: raised, miss: wrist.miss });
+    Object.assign(report, { flex: wrist.flex, radial: wrist.radial, twist: wrist.twist, elbow: raised, miss: wrist.miss, short, overlap: best.overlap, clavicle: clavicleTurn });
   }
+  arm.shoulder = restShoulder;
   return arm.hand.matrixWorld.clone();
+}
+
+/** How deep (metres) the upper arm and forearm, as rods about 3.5 cm thick, are in any of the capsules. */
+function armInside(arm: ArmRig, elbow: Vector3, wrist: Vector3, avoid: Capsule[]): number {
+  let worst = 0;
+  const p = new Vector3();
+  // points along both bones; the shoulder end is left out, it is joined to the body
+  for (const [a, b, from] of [[arm.shoulder, elbow, 0.35], [elbow, wrist, 0]] as const) {
+    for (let k = 0; k <= 6; k++) {
+      p.lerpVectors(a, b, from + (1 - from) * (k / 6));
+      for (const c of avoid) worst = Math.max(worst, c.radius + 0.035 - segPoint(p, c.a, c.b));
+    }
+  }
+  return Math.max(0, worst);
+}
+
+function segPoint(p: Vector3, a: Vector3, b: Vector3): number {
+  const ab = b.clone().sub(a);
+  const t = Math.max(0, Math.min(1, p.clone().sub(a).dot(ab) / Math.max(1e-12, ab.lengthSq())));
+  return p.distanceTo(a.clone().addScaledVector(ab, t));
 }
 
 /**
