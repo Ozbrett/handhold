@@ -8,7 +8,8 @@
  * The manifest (the game writes it, for example from an editor script); an optional top-level "hinges": "bone:ax,ay,az,maxDegrees,px,py,pz;..."
  * (each finger bone's one bending axis and rest position, in the game's rest space, mirrored like the rest) makes the fingers bend only about those
  * (--no-hinges ignores it):
- *   { "items": [ { "name", "pose", "frame", "side": "right"|"left", "file": "<obj in the folder>",
+ *   { "items": [ { "name", "pose", "frame", "part" (optional: the fitted part the hold is on, 0 or absent for the bare frame),
+ *                  "side": "right"|"left", "file": "<obj in the folder>",
  *                  "relax": "index" (fingers left straight), "place": "hand_r:x,y,z;index_01_r:x,y,z;..." } ] }
  * "place" is where the game has put the hand's bones, in the held thing's own axes (mirrored to right-handed). The hand is lined up
  * on those bones and only the fingers and thumb are closed, on the real mesh, so the result drops straight into the game's own
@@ -103,11 +104,14 @@ try {
     const gripAfter = new Map();
     for (const it0 of mine) {
       const t0 = Date.now();
-      const tag = `${it0.pose}_${it0.frame}_${it0.side}`;
+      // a hold on a fitted part (a foregrip, a magazine) is its own hold: the part is in its name
+      const part = it0.part ? `_p${it0.part}` : '';
+      const tag = `${it0.pose}_${it0.frame}${part}_${it0.side}`;
+      const gripKey = `${it0.frame}/${it0.part ?? 0}`;
       const obj = readFileSync(join(inDir, it0.file), 'utf8');
       // the idle hold keeps the grip hold's hand where it is
-      const onGrip = it0.pose === 'idle' && gripAfter.has(it0.frame);
-      const it = onGrip ? { ...it0, place: gripAfter.get(it0.frame) } : it0;
+      const onGrip = it0.pose === 'idle' && gripAfter.has(gripKey);
+      const it = onGrip ? { ...it0, place: gripAfter.get(gripKey) } : it0;
       const adjust = onGrip ? null : { move: Number(args.move ?? 0.2), turn: Number(args.turn ?? 15) };
       // on the grip the trigger finger's tip goes onto the trigger: the middle of the part the file names Trigger
       const trigger = it.pose === 'grip' ? partCentre(obj, /^trigger/i) : null;
@@ -136,7 +140,10 @@ try {
           if (trigger && index >= 0 && !hh.actions.pinAt(index, trigger)) triggerMiss = hh.ui.pinMiss * hh.hand.rig.model.size;
           // the site keeps the drawn skin out of the whole held thing (both ways, edges included), moving fingers or the hand
           const skin = hh.skin();
+          // what the game must draw for this to be the hold: every finger joint, each tip, the touches (the verify step compares them)
+          const drawn = hh.handJoints();
           return {
+            drawn,
             placed: hh.placed,
             stable: g.stable,
             squeeze: Number.isFinite(g.effort) ? Number(g.effort.toFixed(2)) : -1,
@@ -168,15 +175,18 @@ try {
       }
       const poseFile = `${tag}.pose.json`;
       writeFileSync(join(out, poseFile), JSON.stringify(r.pose, null, 1));
-      const { pose, after, ...stats } = r;
+      const { pose, after, drawn, ...stats } = r;
       const round = (x) => Math.round(x * 1e6) / 1e6;
+      const points = (list) => (list ?? []).map((p) => `${p.name}:${p.at.map(round).join(',')}`).join(';');
+      const joints = points(drawn?.joints), tips = points(drawn?.tips);
+      const contacts = (drawn?.contacts ?? []).map((c) => `${c.finger}.${c.link}:${c.at.map(round).join(',')}`).join(';');
       const placeAfter = after.filter((a) => a.at).map((a) => `${a.name}:${a.at.map(round).join(',')}`).join(';');
-      if (it.pose === 'grip') gripAfter.set(it.frame, placeAfter);
+      if (it.pose === 'grip') gripAfter.set(gripKey, placeAfter);
       // how far the hand bone moved from where the game put it
       const was = it0.place.split(';')[0].split(':')[1].split(',').map(Number);
       const now = after[0]?.at ?? was;
       const moved = Math.hypot(now[0] - was[0], now[1] - was[1], now[2] - was[2]);
-      results.push({ ...strip(it0), ...stats, place: it0.place, placeAfter, moved: round(moved), poseFile });
+      results.push({ ...strip(it0), ...stats, place: it0.place, placeAfter, joints, tips, contacts, moved: round(moved), poseFile });
       const fit = r.placed ? `fit ${(r.placed.rms * 1000).toFixed(1)} mm, scale ${r.placed.scale.toFixed(3)}` : 'no fit';
       const deep = r.depth ? Object.entries(r.depth).filter(([, d]) => d * 1000 > SkinDepthMm) : [];
       if (deep.length || !r.skinClear) problems.push(`${tag}: skin and the held thing in each other: ${deep.map(([k, d]) => `${k} ${(d * 1000).toFixed(1)} mm`).join(', ') || 'not cleared'}`);
@@ -263,7 +273,7 @@ function partCentre(text, name) {
   return n ? sum.map((x) => x / n) : null;
 }
 function strip(it) {
-  return { name: it.name, pose: it.pose, frame: it.frame, side: it.side, file: it.file, relax: it.relax ?? '' };
+  return { name: it.name, pose: it.pose, frame: it.frame, part: it.part ?? 0, side: it.side, file: it.file, relax: it.relax ?? '' };
 }
 const summary = { hand: resolve(args.hand), in: inDir, out, holds: results, problems };
 writeFileSync(join(out, 'summary.json'), JSON.stringify(summary, null, 1));

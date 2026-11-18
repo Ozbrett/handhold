@@ -1182,7 +1182,16 @@ async function findGrips() {
     gripNormal: at.normal,
     ...(at === grip && aim1 ? { aim: aim1 } : at === grip2 && aim2 ? { aim: aim2 } : {}),
     ...(carried ? { com: at.point } : {}),
-    ...(at === grip && placed ? { wrist: placed.wrist, relax: placed.relax, adjust: placed.adjust, reach: placed.reach } : {}),
+    ...(at === grip && placed
+      ? {
+          wrist: placed.wrist,
+          relax: placed.relax,
+          adjust: placed.adjust,
+          reach: placed.reach,
+          // the place is judged on the drawn skin, which is what settle() keeps out of the part afterwards
+          skinDepth: (w: Matrix4, a: Float32Array) => guardFor(hand!.rig, object!.grasp).measure(w, a).worst,
+        }
+      : {}),
     mode: ui.mode,
     friction: ui.friction,
     // more of each hand's grips to pair up
@@ -2079,6 +2088,49 @@ Object.assign(window as unknown as Record<string, unknown>, {
         const i = char.bones.findIndex((b) => key(b.name) === key(name));
         return { name, at: i < 0 ? null : char.restHead[i].clone().applyMatrix4(g.wrist).applyMatrix4(toFile).toArray() };
       });
+    },
+    /**
+     * What an engine must draw for the chosen grip to be this one, in the object file's own axes: every posed finger bone's joint
+     * (the character's own bones, as the exported pose turns them), each finger's tip (the end its last bone points at), and where
+     * the drawn skin touches the held thing. Measured off the hand bone, so it holds wherever the character view put the model.
+     */
+    handJoints() {
+      const g = grasps?.[ui.selected] && settle(grasps[ui.selected]);
+      const h = hand;
+      const char = h?.char;
+      if (!g || !h || !char || !object) return null;
+      object.source.updateMatrixWorld(true);
+      const toFile = object.source.matrixWorld.clone().invert();
+      const hi = char.bones.indexOf(char.handBone);
+      if (hi < 0) return null;
+      poseCharacter(char, h.rig.model, g.angles);
+      // posed bone -> the hand's rest frame -> the grip's wrist -> the file
+      const restHand = char.restInverse[hi].clone().invert();
+      const fromPosed = toFile.clone().multiply(g.wrist).multiply(restHand).multiply(char.handBone.matrixWorld.clone().invert());
+      const joints: { name: string; at: number[] }[] = [];
+      const tips: { name: string; at: number[] }[] = [];
+      char.bones.forEach((b, i) => {
+        if (char.jointOf[i] === 0) return;
+        joints.push({ name: b.name, at: b.getWorldPosition(new Vector3()).applyMatrix4(fromPosed).toArray() });
+        const aim = char.aim[i];
+        // the last bone of a finger aims at the fingertip, not at another bone's pivot
+        const last = !char.bones.some((c, k) => k !== i && char.jointOf[k] !== 0 && c.parent === b);
+        if (aim && last) {
+          const tip = aim.point.clone().applyMatrix4(char.restInverse[i]).applyMatrix4(b.matrixWorld).applyMatrix4(fromPosed);
+          tips.push({ name: b.name, at: tip.toArray() });
+          // the same tip with the finger at rest and the hand where it holds: an engine carries this on its own last bone
+          tips.push({ name: `${b.name}@rest`, at: aim.point.clone().applyMatrix4(g.wrist).applyMatrix4(toFile).toArray() });
+          joints.push({ name: `${b.name}@rest`, at: char.restHead[i].clone().applyMatrix4(g.wrist).applyMatrix4(toFile).toArray() });
+        }
+      });
+      if (!characterView) poseCharacter(char, h.rig.model, null);
+      const names = h.rig.model.fingers.map((f) => f.name);
+      const contacts = (g.contacts ?? []).map((c) => ({
+        finger: c.finger < 0 ? 'palm' : names[c.finger],
+        link: c.link,
+        at: c.point.clone().applyMatrix4(toFile).toArray(),
+      }));
+      return { joints, tips, contacts };
     },
     get pendingHands() {
       return pendingHands;
