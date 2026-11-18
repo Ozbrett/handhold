@@ -5,7 +5,10 @@ import { buildRiggedHand, setHandPose } from '../src/app/handRig';
 import { bakeToTriMesh, looksLikeCharacter, subsetBaked } from '../src/app/loaders';
 import { onOwnSkeleton } from '../src/app/ownSkeleton';
 import { sampleCharacter } from '../src/app/samples';
-import { skinPositions } from '../src/check/body';
+import { characterPoseJson } from '../src/app/exporter';
+import { buildBody, posedSkin, skinPositions } from '../src/check/body';
+import { applyFingerDeltas } from '../src/check/poseFile';
+import type { Grasp } from '../src/core/grasp/solver';
 import { type HandAnalysis, analyzeHandMesh } from '../src/core/hand/analyze';
 import { locateHands } from '../src/core/hand/locate';
 
@@ -66,5 +69,49 @@ describe('a character hand on its own skeleton', () => {
     expect(after.n).toBeGreaterThan(200);
     expect(before.worst).toBeGreaterThan(0.002);
     expect(after.worst).toBeLessThan(0.0005);
+  });
+
+  it('reads the exported pose file back onto a fresh copy of the character as the same fingers', () => {
+    const source = sampleCharacter();
+    source.updateMatrixWorld(true);
+    const full = bakeToTriMesh(source);
+    const h = locateHands(full.mesh, { character: looksLikeCharacter(source) }).hands[0];
+    const baked = subsetBaked(full, h.keep);
+    const own = onOwnSkeleton(source, full, h.keep, baked, analyzeHandMesh(baked.mesh, { flipPalm: h.flip }), { flipPalm: h.flip });
+    const model = own.analysis.model;
+    const angles = new Float32Array(model.dofCount);
+    model.joints.forEach((j) => j.dofs.forEach((d, k) => (angles[j.dofStart + k] = k === 0 ? Math.min(d.max, 1.1) : 0)));
+    const grasp = { wrist: new Matrix4(), angles, contacts: [], stable: true, effort: 1, segmentsTouching: 0, segmentsTotal: 0 } as unknown as Grasp;
+    const file = characterPoseJson(own.char!, model, grasp, null, null);
+    // what the site posed: the character's own skin under the exported bones
+    const key = (a: ArrayLike<number>, i: number) => `${Math.round(a[i * 3] * 1e5)},${Math.round(a[i * 3 + 1] * 1e5)},${Math.round(a[i * 3 + 2] * 1e5)}`;
+    const posed = new Map<string, number[]>();
+    source.traverse((o) => {
+      const m = o as import('three').SkinnedMesh;
+      if (!m.isSkinnedMesh) return;
+      const rest = m.geometry.getAttribute('position').array, now = skinPositions(m);
+      for (let i = 0; i < now.length / 3; i++) posed.set(key(rest, i), [now[i * 3], now[i * 3 + 1], now[i * 3 + 2]]);
+    });
+    // what a reader of the file gets on its own copy
+    const body = buildBody(sampleCharacter())!;
+    expect(applyFingerDeltas(body, file.bones, file.handBone)).toEqual([]);
+    body.root.updateMatrixWorld(true);
+    const now = posedSkin(body);
+    let worst = 0, moved = 0, n = 0;
+    body.skin.forEach((s, pi) => {
+      const rest = s.mesh.geometry.getAttribute('position').array;
+      for (let i = 0; i < rest.length / 3; i++) {
+        const o = posed.get(key(rest, i));
+        if (!o) continue;
+        n++;
+        const d = Math.hypot(o[0] - now[pi][i * 3], o[1] - now[pi][i * 3 + 1], o[2] - now[pi][i * 3 + 2]);
+        worst = Math.max(worst, d);
+        moved = Math.max(moved, Math.hypot(o[0] - s.rest[i * 3], o[1] - s.rest[i * 3 + 1], o[2] - s.rest[i * 3 + 2]));
+      }
+    });
+    expect(n).toBeGreaterThan(200);
+    // the fingers really curled, and the reader's skin lands on the site's to under a millimetre
+    expect(moved).toBeGreaterThan(0.02);
+    expect(worst).toBeLessThan(0.001);
   });
 });
