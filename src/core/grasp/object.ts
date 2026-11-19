@@ -4,6 +4,25 @@ import { type TriMesh, computeBounds, surfaceCentroid, volumeAndCentroid, weldMe
 
 const _hit = { point: new Vector3(), distance: 0, faceIndex: 0 };
 const _p = new Vector3();
+const _c = new Vector3();
+const _e1 = new Vector3();
+const _e2 = new Vector3();
+const _n = new Vector3();
+const _sum = new Vector3();
+const _on = new Vector3();
+const _A = new Vector3();
+const _B = new Vector3();
+const _C = new Vector3();
+/** Two points nearer than this are the same point of the surface (metres): well over a file's rounding, well under any part's thickness. */
+const SAME = 2e-5;
+
+/** How far `p` is from the segment ab. */
+function offSegment(p: Vector3, a: Vector3, b: Vector3): number {
+  _e1.subVectors(b, a);
+  const l = _e1.lengthSq();
+  const t = l > 0 ? Math.max(0, Math.min(1, _e2.subVectors(p, a).dot(_e1) / l)) : 0;
+  return _e2.copy(a).addScaledVector(_e1, t).distanceTo(p);
+}
 
 /**
  * The thing being held: a triangle mesh with fast "how far is the surface
@@ -74,7 +93,17 @@ export class GraspObject {
     const vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
     const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
     const dx = x - h.point.x, dy = y - h.point.y, dz = z - h.point.z;
-    const side = (dx * nx + dy * ny + dz * nz) * this.flip;
+    let side = (dx * nx + dy * ny + dz * nz) * this.flip;
+    // On an edge or a corner one face cannot say which side the point is on: where two faces meet sharper than a right angle, a point
+    // outside is still behind one of them. Every face that meets there says, each by the angle it takes up round the point.
+    const d0 = h.distance;
+    if (d0 > 1e-9) {
+      const A = _A.set(P[a], P[a + 1], P[a + 2]), B = _B.set(P[b], P[b + 1], P[b + 2]), C = _C.set(P[c], P[c + 1], P[c + 2]);
+      _c.copy(h.point);
+      if (offSegment(_c, A, B) < SAME || offSegment(_c, B, C) < SAME || offSegment(_c, C, A) < SAME) {
+        if (this.around(_c)) side = (dx * _sum.x + dy * _sum.y + dz * _sum.z) * this.flip;
+      }
+    }
     this.lastPoint.copy(h.point);
     const d = h.distance;
     if (d > 1e-9) {
@@ -85,5 +114,32 @@ export class GraspObject {
       this.lastNormal.set((nx / l) * this.flip, (ny / l) * this.flip, (nz / l) * this.flip);
     }
     return side >= 0 ? d : -d;
+  }
+
+  /**
+   * The faces meeting at a point of the surface, added up into `_sum`: each face's unit normal times the angle the face takes up round
+   * the point (a corner's own angle, a half turn on an edge, a whole turn inside a face). False when they cancel out or none is found.
+   */
+  private around(at: Vector3): boolean {
+    _sum.set(0, 0, 0);
+    this.bvh.shapecast({
+      intersectsBounds: (box) => box.distanceToPoint(at) <= SAME,
+      intersectsTriangle: (tri) => {
+        if (tri.closestPointToPoint(at, _on).distanceTo(at) > SAME) return false;
+        _n.subVectors(tri.b, tri.a).cross(_e2.subVectors(tri.c, tri.a));
+        const area = _n.length();
+        if (area < 1e-14) return false;
+        _n.multiplyScalar(1 / area);
+        const corner = (v: Vector3, u: Vector3, w: Vector3) => _on.subVectors(u, v).angleTo(_e2.subVectors(w, v));
+        let angle = 2 * Math.PI;
+        if (at.distanceTo(tri.a) < SAME) angle = corner(tri.a, tri.b, tri.c);
+        else if (at.distanceTo(tri.b) < SAME) angle = corner(tri.b, tri.c, tri.a);
+        else if (at.distanceTo(tri.c) < SAME) angle = corner(tri.c, tri.a, tri.b);
+        else if (offSegment(at, tri.a, tri.b) < SAME || offSegment(at, tri.b, tri.c) < SAME || offSegment(at, tri.c, tri.a) < SAME) angle = Math.PI;
+        _sum.addScaledVector(_n, angle);
+        return false;
+      },
+    });
+    return _sum.lengthSq() > 1e-6;
   }
 }
