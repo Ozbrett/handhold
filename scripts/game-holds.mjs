@@ -120,7 +120,7 @@ try {
           const hh = window.__handhold;
           await hh.actions.objectFile(new File([obj], file));
           if (!hh.object) return { error: hh.ui.objectError ?? 'object did not load' };
-          hh.actions.setCarried(it.pose !== 'torch');
+          hh.actions.setCarried(!['torch', 'knife', 'shovel'].includes(it.pose));
           const points = it.place.split(';').map((e) => {
             const [name, xyz] = e.split(':');
             return { name, at: xyz.split(',').map(Number) };
@@ -233,7 +233,8 @@ try {
         };
         await shoot('');
         // --compare: the game's own hold, the arms as the game posed them (HandholdExport writes game_*.obj), Handhold's hand hidden
-        const gameFile = it.pose === 'torch' ? 'game_torch.obj' : `game_${it.pose === 'reload' ? 'reload' : 'grip'}_${it.frame}_${it.name}.obj`;
+        // an item in the fist (the torch, a blade) has one game file named after its hold
+        const gameFile = ['torch', 'knife', 'shovel'].includes(it.pose) ? `game_${it.pose}.obj` : `game_${it.pose === 'reload' ? 'reload' : 'grip'}_${it.frame}_${it.name}.obj`;
         if (args.compare && existsSync(join(inDir, gameFile))) {
           const ok = await page.evaluate(
             async ({ obj, file }) => {
