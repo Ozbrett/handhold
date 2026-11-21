@@ -24,6 +24,39 @@ function offSegment(p: Vector3, a: Vector3, b: Vector3): number {
   return _e2.copy(a).addScaledVector(_e1, t).distanceTo(p);
 }
 
+/** Whether a point of triangle abc lies on one of its edges or corners, where the triangle alone cannot say which side is out. */
+export function onTriangleEdge(p: Vector3, a: Vector3, b: Vector3, c: Vector3): boolean {
+  return offSegment(p, a, b) < SAME || offSegment(p, b, c) < SAME || offSegment(p, c, a) < SAME;
+}
+
+/**
+ * The faces of a mesh meeting at a point of its surface, added up into `out`: each face's unit normal (by its own winding) times the
+ * angle the face takes up round the point (a corner's own angle, a half turn on an edge, a whole turn inside a face). False when they
+ * cancel out or none is found.
+ */
+export function facesAround(bvh: MeshBVH, at: Vector3, out: Vector3): boolean {
+  out.set(0, 0, 0);
+  bvh.shapecast({
+    intersectsBounds: (box) => box.distanceToPoint(at) <= SAME,
+    intersectsTriangle: (tri) => {
+      if (tri.closestPointToPoint(at, _on).distanceTo(at) > SAME) return false;
+      _n.subVectors(tri.b, tri.a).cross(_e2.subVectors(tri.c, tri.a));
+      const area = _n.length();
+      if (area < 1e-14) return false;
+      _n.multiplyScalar(1 / area);
+      const corner = (v: Vector3, u: Vector3, w: Vector3) => _on.subVectors(u, v).angleTo(_e2.subVectors(w, v));
+      let angle = 2 * Math.PI;
+      if (at.distanceTo(tri.a) < SAME) angle = corner(tri.a, tri.b, tri.c);
+      else if (at.distanceTo(tri.b) < SAME) angle = corner(tri.b, tri.c, tri.a);
+      else if (at.distanceTo(tri.c) < SAME) angle = corner(tri.c, tri.a, tri.b);
+      else if (onTriangleEdge(at, tri.a, tri.b, tri.c)) angle = Math.PI;
+      out.addScaledVector(_n, angle);
+      return false;
+    },
+  });
+  return out.lengthSq() > 1e-6;
+}
+
 /**
  * The thing being held: a triangle mesh with fast "how far is the surface
  * from here" queries, plus its centre of mass.
@@ -100,9 +133,7 @@ export class GraspObject {
     if (d0 > 1e-9) {
       const A = _A.set(P[a], P[a + 1], P[a + 2]), B = _B.set(P[b], P[b + 1], P[b + 2]), C = _C.set(P[c], P[c + 1], P[c + 2]);
       _c.copy(h.point);
-      if (offSegment(_c, A, B) < SAME || offSegment(_c, B, C) < SAME || offSegment(_c, C, A) < SAME) {
-        if (this.around(_c)) side = (dx * _sum.x + dy * _sum.y + dz * _sum.z) * this.flip;
-      }
+      if (onTriangleEdge(_c, A, B, C) && facesAround(this.bvh, _c, _sum)) side = (dx * _sum.x + dy * _sum.y + dz * _sum.z) * this.flip;
     }
     this.lastPoint.copy(h.point);
     const d = h.distance;
@@ -114,32 +145,5 @@ export class GraspObject {
       this.lastNormal.set((nx / l) * this.flip, (ny / l) * this.flip, (nz / l) * this.flip);
     }
     return side >= 0 ? d : -d;
-  }
-
-  /**
-   * The faces meeting at a point of the surface, added up into `_sum`: each face's unit normal times the angle the face takes up round
-   * the point (a corner's own angle, a half turn on an edge, a whole turn inside a face). False when they cancel out or none is found.
-   */
-  private around(at: Vector3): boolean {
-    _sum.set(0, 0, 0);
-    this.bvh.shapecast({
-      intersectsBounds: (box) => box.distanceToPoint(at) <= SAME,
-      intersectsTriangle: (tri) => {
-        if (tri.closestPointToPoint(at, _on).distanceTo(at) > SAME) return false;
-        _n.subVectors(tri.b, tri.a).cross(_e2.subVectors(tri.c, tri.a));
-        const area = _n.length();
-        if (area < 1e-14) return false;
-        _n.multiplyScalar(1 / area);
-        const corner = (v: Vector3, u: Vector3, w: Vector3) => _on.subVectors(u, v).angleTo(_e2.subVectors(w, v));
-        let angle = 2 * Math.PI;
-        if (at.distanceTo(tri.a) < SAME) angle = corner(tri.a, tri.b, tri.c);
-        else if (at.distanceTo(tri.b) < SAME) angle = corner(tri.b, tri.c, tri.a);
-        else if (at.distanceTo(tri.c) < SAME) angle = corner(tri.c, tri.a, tri.b);
-        else if (offSegment(at, tri.a, tri.b) < SAME || offSegment(at, tri.b, tri.c) < SAME || offSegment(at, tri.c, tri.a) < SAME) angle = Math.PI;
-        _sum.addScaledVector(_n, angle);
-        return false;
-      },
-    });
-    return _sum.lengthSq() > 1e-6;
   }
 }

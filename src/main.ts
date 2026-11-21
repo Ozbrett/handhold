@@ -1197,8 +1197,10 @@ async function findGrips() {
     // more of each hand's grips to pair up
     ...(two ? { maxResults: 6 } : {}),
   });
+  // finding grips is the quick part; keeping the drawn skin out of the item for each one takes the rest of the bar
+  const solving = 0.25;
   const first = await solveGrasp(hand.rig.model, object.grasp, settings(grip), {
-    onProgress: (f) => panel.setProgress(two ? f / 2 : f),
+    onProgress: (f) => panel.setProgress(solving * (two ? f / 2 : f)),
     cancelled: () => token.cancelled,
   });
   if (token.cancelled) return;
@@ -1206,7 +1208,7 @@ async function findGrips() {
   if (two) {
     const s = support!;
     const second = await solveGrasp(s.rig.model, object.grasp, settings(grip2!), {
-      onProgress: (f) => panel.setProgress(0.5 + f / 2),
+      onProgress: (f) => panel.setProgress(solving * (0.5 + f / 2)),
       cancelled: () => token.cancelled,
     });
     if (token.cancelled) return;
@@ -1234,6 +1236,7 @@ async function findGrips() {
     if (second && support) settle(second, support.rig);
     const clear = settledFrom.get(found[i])?.result.clear !== false && (!second || settledFrom.get(second)?.result.clear !== false);
     if (clear) out.push(i);
+    panel.setProgress(solving + ((1 - solving) * (i + 1)) / found.length);
     await nextFrame();
     if (token.cancelled) return;
   }

@@ -1,7 +1,7 @@
 import type { Contact } from '../core/grasp/quality';
 import { BufferAttribute, BufferGeometry, Matrix4, Vector3 } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
-import type { GraspObject } from '../core/grasp/object';
+import { type GraspObject, facesAround, onTriangleEdge } from '../core/grasp/object';
 import { type RiggedHand, setHandPose } from './handRig';
 
 /**
@@ -63,7 +63,20 @@ interface Piece {
   links: number;
   /** No point is deeper inside this piece than this: its flesh is not that thick (metres). */
   deepest: number;
+  /** The bones that move this piece's vertices, as `mesh * BONE_KEY + bone`. */
+  deps: Uint32Array;
+  /** The pose version its vertices were last posed at, and its tree last refitted at (-1: never). */
+  posedAt: number;
+  fitAt: number;
+  /** Where its vertices were when the bounds below were taken, and the furthest any has moved from there since (metres). */
+  ref: Float32Array | null;
+  drift: number;
+  /** For each point of the held thing, a distance the skin was at least this far from it (-Infinity: not known). */
+  bound: Float64Array;
 }
+
+/** Keys a bone of one of the hand's meshes: `mesh * BONE_KEY + bone`. */
+const BONE_KEY = 65536;
 
 interface Violation {
   depth: number;
@@ -84,27 +97,179 @@ interface PieceEval {
 
 /** Points along the held thing's edges are this far apart at most: thinner than a finger's skin is between its points. */
 const EDGE_STEP = 0.002;
+/** Points of the held thing are looked for inside the skin this near its surface (metres). */
+const REACH = 0.012;
+/** And measured a little further than that, so a point found out of reach can be left alone until the skin has moved this far. */
+const PROBE = 0.01;
+/** A measured gap is exact up to this (metres); further gaps are only known to be further. */
+const GAP_EXACT = 0.01;
 
-/** Every corner of a mesh and points along each of its edges, each edge once. */
-function edgePoints(P: Float32Array, I: Uint32Array): Float32Array {
-  const out: number[] = Array.from(P);
-  const seen = new Set<string>();
-  for (let t = 0; t + 2 < I.length; t += 3) {
+/** The held thing's points sorted into a grid of cells, so the ones near a piece of skin are found without going through all. */
+interface PointGrid {
+  lo: Vector3;
+  cell: number;
+  nx: number;
+  ny: number;
+  nz: number;
+  /** Cell c holds items[start[c]] up to items[start[c + 1]], in ascending order. */
+  start: Int32Array;
+  items: Int32Array;
+  scratch: Int32Array;
+  all: Int32Array;
+}
+
+function pointGrid(O: Float32Array, lo: Vector3, hi: Vector3): PointGrid {
+  const n = O.length / 3;
+  const size = Math.max(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z, 1e-6);
+  const cell = Math.max(0.008, size / 48);
+  const nx = Math.max(1, Math.ceil((hi.x - lo.x) / cell) + 1);
+  const ny = Math.max(1, Math.ceil((hi.y - lo.y) / cell) + 1);
+  const nz = Math.max(1, Math.ceil((hi.z - lo.z) / cell) + 1);
+  const at = (v: number, o: number, k: number) => Math.min(k - 1, Math.max(0, Math.floor((v - o) / cell)));
+  const cellOf = new Int32Array(n);
+  const start = new Int32Array(nx * ny * nz + 1);
+  for (let j = 0; j < n; j++) {
+    const c = (at(O[j * 3 + 2], lo.z, nz) * ny + at(O[j * 3 + 1], lo.y, ny)) * nx + at(O[j * 3], lo.x, nx);
+    cellOf[j] = c;
+    start[c + 1]++;
+  }
+  for (let c = 0; c < nx * ny * nz; c++) start[c + 1] += start[c];
+  const fill = start.slice(0, nx * ny * nz);
+  const items = new Int32Array(n);
+  for (let j = 0; j < n; j++) items[fill[cellOf[j]]++] = j;
+  return { lo: lo.clone(), cell, nx, ny, nz, start, items, scratch: new Int32Array(n), all: Int32Array.from({ length: n }, (_, j) => j) };
+}
+
+/** Faces meeting at an edge this far from flat (radians) make a sharp edge, which can poke into the skin anywhere along it. */
+const SHARP = 0.17;
+/** A corner whose faces take up this much less than a whole turn round it is a point, even if no edge into it is sharp. */
+const POINTED = 0.35;
+/**
+ * The rest of the surface is looked at this far apart (metres). A smooth bump can poke between a coarse skin's points too, but one
+ * that pokes a millimetre in is wider than this where it does.
+ */
+const SURFACE_STEP = 0.003;
+
+/**
+ * Points of a mesh that may poke into the skin between the skin's own points: along every sharp edge (convex, if the mesh says
+ * which side is out) and open rim, each edge once, the corners at their ends or that come to a point, and the rest of the surface
+ * evenly, about SURFACE_STEP apart however finely or coarsely it is cut into triangles.
+ */
+function edgePoints(P: Float32Array, I: Uint32Array, flip: number, closed: boolean): Float32Array {
+  const nv = P.length / 3;
+  // one id per place, so faces that do not share vertices still meet
+  const canon = new Uint32Array(nv);
+  const at = new Map<string, number>();
+  for (let i = 0; i < nv; i++) {
+    const k = `${Math.round(P[i * 3] * 1e5)},${Math.round(P[i * 3 + 1] * 1e5)},${Math.round(P[i * 3 + 2] * 1e5)}`;
+    const c = at.get(k);
+    if (c === undefined) at.set(k, (canon[i] = i));
+    else canon[i] = c;
+  }
+  const nt = Math.floor(I.length / 3);
+  const normal = new Float64Array(nt * 3);
+  const turn = new Float64Array(nv);
+  for (let t = 0; t < nt; t++) {
+    const a = I[t * 3] * 3, b = I[t * 3 + 1] * 3, c = I[t * 3 + 2] * 3;
+    _ab.set(P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]);
+    _ac.set(P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]);
+    _n.crossVectors(_ab, _ac);
+    const l = _n.length();
+    if (l > 0) _n.multiplyScalar(flip / l);
+    normal[t * 3] = _n.x;
+    normal[t * 3 + 1] = _n.y;
+    normal[t * 3 + 2] = _n.z;
+    // the angle each corner takes up, added up round each place
     for (let e = 0; e < 3; e++) {
-      const a = I[t + e], b = I[t + ((e + 1) % 3)];
+      const o = I[t * 3 + e] * 3, u = I[t * 3 + ((e + 1) % 3)] * 3, w = I[t * 3 + ((e + 2) % 3)] * 3;
+      _ab.set(P[u] - P[o], P[u + 1] - P[o + 1], P[u + 2] - P[o + 2]);
+      _ac.set(P[w] - P[o], P[w + 1] - P[o + 1], P[w + 2] - P[o + 2]);
+      if (_ab.lengthSq() > 0 && _ac.lengthSq() > 0) turn[canon[I[t * 3 + e]]] += _ab.angleTo(_ac);
+    }
+  }
+  // the faces at each edge, and the corner of each face across from it
+  const faces = new Map<string, number[]>();
+  for (let t = 0; t < nt; t++) {
+    for (let e = 0; e < 3; e++) {
+      const a = canon[I[t * 3 + e]], b = canon[I[t * 3 + ((e + 1) % 3)]];
+      if (a === b) continue;
       const key = a < b ? `${a},${b}` : `${b},${a}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const ax = P[a * 3], ay = P[a * 3 + 1], az = P[a * 3 + 2];
-      const dx = P[b * 3] - ax, dy = P[b * 3 + 1] - ay, dz = P[b * 3 + 2] - az;
-      const n = Math.floor(Math.hypot(dx, dy, dz) / EDGE_STEP);
-      for (let i = 1; i <= n; i++) {
-        const f = i / (n + 1);
-        out.push(ax + dx * f, ay + dy * f, az + dz * f);
+      const list = faces.get(key);
+      if (list) list.push(t, I[t * 3 + ((e + 2) % 3)]);
+      else faces.set(key, [t, I[t * 3 + ((e + 2) % 3)]]);
+    }
+  }
+  const keep = new Uint8Array(nv);
+  const out: number[] = [];
+  const cos = Math.cos(SHARP);
+  for (const [key, list] of faces) {
+    const comma = key.indexOf(',');
+    const a = Number(key.slice(0, comma)), b = Number(key.slice(comma + 1));
+    let sharp = list.length !== 4;
+    if (!sharp) {
+      const t = list[0], u = list[2], far = list[3] * 3;
+      const d = normal[t * 3] * normal[u * 3] + normal[t * 3 + 1] * normal[u * 3 + 1] + normal[t * 3 + 2] * normal[u * 3 + 2];
+      // convex: the other face's far corner lies behind this face (a closed mesh says which side is out)
+      const behind =
+        (P[far] - P[a * 3]) * normal[t * 3] + (P[far + 1] - P[a * 3 + 1]) * normal[t * 3 + 1] + (P[far + 2] - P[a * 3 + 2]) * normal[t * 3 + 2];
+      sharp = d < cos && (!closed || behind < 0);
+    }
+    if (!sharp) continue;
+    keep[a] = keep[b] = 1;
+    const ax = P[a * 3], ay = P[a * 3 + 1], az = P[a * 3 + 2];
+    const dx = P[b * 3] - ax, dy = P[b * 3 + 1] - ay, dz = P[b * 3 + 2] - az;
+    const n = Math.floor(Math.hypot(dx, dy, dz) / EDGE_STEP);
+    for (let i = 1; i <= n; i++) {
+      const f = i / (n + 1);
+      out.push(ax + dx * f, ay + dy * f, az + dz * f);
+    }
+  }
+  const corners: number[] = [];
+  for (let i = 0; i < nv; i++) {
+    if (canon[i] !== i) continue;
+    if (keep[i] || Math.abs(2 * Math.PI - turn[i]) > POINTED) corners.push(P[i * 3], P[i * 3 + 1], P[i * 3 + 2]);
+  }
+  // the rest of the surface: rows across each triangle SURFACE_STEP apart, a point every SURFACE_STEP along each row, and one
+  // point kept in each cell SURFACE_STEP wide (a long thin triangle gets as many points as its area needs, not its length squared)
+  let lx = Infinity, ly = Infinity, lz = Infinity;
+  for (let i = 0; i < nv; i++) {
+    lx = Math.min(lx, P[i * 3]);
+    ly = Math.min(ly, P[i * 3 + 1]);
+    lz = Math.min(lz, P[i * 3 + 2]);
+  }
+  const span = 1 << 20;
+  const cells = new Set<number>();
+  const even: number[] = [];
+  const put = (x: number, y: number, z: number) => {
+    const k = (Math.floor((z - lz) / SURFACE_STEP) * span + Math.floor((y - ly) / SURFACE_STEP)) * span + Math.floor((x - lx) / SURFACE_STEP);
+    if (cells.has(k)) return;
+    cells.add(k);
+    even.push(x, y, z);
+  };
+  for (let t = 0; t < nt; t++) {
+    let a = I[t * 3] * 3, b = I[t * 3 + 1] * 3, c = I[t * 3 + 2] * 3;
+    const len = (p: number, q: number) => Math.hypot(P[q] - P[p], P[q + 1] - P[p + 1], P[q + 2] - P[p + 2]);
+    // the longest side is the base, c the corner across from it
+    if (len(b, c) > len(a, b) && len(b, c) >= len(c, a)) [a, b, c] = [b, c, a];
+    else if (len(c, a) > len(a, b)) [a, b, c] = [c, a, b];
+    const base = len(a, b);
+    _ab.set(P[b] - P[a], P[b + 1] - P[a + 1], P[b + 2] - P[a + 2]);
+    _ac.set(P[c] - P[a], P[c + 1] - P[a + 1], P[c + 2] - P[a + 2]);
+    const height = base > 0 ? _n.crossVectors(_ab, _ac).length() / base : 0;
+    const rows = Math.max(1, Math.ceil(height / SURFACE_STEP));
+    for (let r = 0; r <= rows; r++) {
+      // row r runs between the two sides from c, a fraction s of the way down to the base
+      const s = r / rows;
+      const ux = P[c] + (P[a] - P[c]) * s, uy = P[c + 1] + (P[a + 1] - P[c + 1]) * s, uz = P[c + 2] + (P[a + 2] - P[c + 2]) * s;
+      const vx = P[c] + (P[b] - P[c]) * s, vy = P[c + 1] + (P[b + 1] - P[c + 1]) * s, vz = P[c + 2] + (P[b + 2] - P[c + 2]) * s;
+      const n = Math.max(1, Math.ceil((base * s) / SURFACE_STEP));
+      for (let i = 0; i <= n; i++) {
+        const f = i / n;
+        put(ux + (vx - ux) * f, uy + (vy - uy) * f, uz + (vz - uz) * f);
       }
     }
   }
-  return Float32Array.from(out);
+  return Float32Array.from([...corners, ...out, ...even]);
 }
 
 const NAME: Record<string, SkinPart> = { thumb: 'thumb', index: 'index', middle: 'middle', ring: 'ring', pinky: 'little', little: 'little' };
@@ -114,6 +279,19 @@ const _n = new Vector3();
 const _ab = new Vector3();
 const _ac = new Vector3();
 const _hit = { point: new Vector3(), distance: 0, faceIndex: 0 };
+const _m = new Matrix4();
+const _A = new Vector3();
+const _B = new Vector3();
+const _C = new Vector3();
+const _at = new Vector3();
+const _sum = new Vector3();
+const NOT_KNOWN = -Infinity;
+
+/** Whether a matrix's 16 elements equal those stored at `at` in `b`. */
+function sameMatrix(a: ArrayLike<number>, b: ArrayLike<number>, at: number): boolean {
+  for (let i = 0; i < 16; i++) if (a[i] !== b[at + i]) return false;
+  return true;
+}
 
 export class SkinGuard {
   /** Each skin vertex: which mesh, and its index there. */
@@ -135,16 +313,36 @@ export class SkinGuard {
   private readonly objPts: Float32Array;
   /** Every skin triangle (vertex ids), for the winding number. */
   private readonly allTris: Uint32Array;
-  /** Bumped by each place(); the whole skin is posed again when a winding number is wanted after one. */
-  private placed = 0;
-  private wholePosed = -1;
+  /**
+   * Skinning, done here rather than by three.js's getVertexPosition (the same sums in the same order, so the same numbers, without
+   * the per-vertex matrix products): each vertex's rest position in bind space, its four bones and weights, and for each mesh each
+   * bone's world matrix times its inverse bind matrix, for the pose last placed.
+   */
+  private readonly bindPos: Float64Array;
+  private readonly skinBone: Uint16Array;
+  private readonly skinW: Float64Array;
+  private readonly boneMats: Float64Array[];
+  /**
+   * Bumped whenever place() moves anything: each bone and each mesh keeps the version it last moved at, so a piece whose bones
+   * have not moved since it was posed (another finger was turned, or the same pose was placed again) is not posed or refitted again.
+   */
+  private version = 0;
+  private readonly boneVersion: Uint32Array[];
+  private readonly meshVersion: Uint32Array;
+  /** The pose version the whole skin's tree was last refitted at (-1: never). */
+  private wholeAt = -1;
   private readonly whole: { geo: BufferGeometry; bvh: MeshBVH | null; loops: Uint32Array[] };
   /** Winding answers for the held thing's points where the hand is now. */
   private readonly inside = new Map<number, boolean>();
+  private readonly grid: PointGrid;
+  /** Each skin point where it was last measured against the held thing, and its distance from it then (-Infinity: never). */
+  private readonly refPos: Float32Array;
+  private readonly refDist: Float64Array;
   /** Distance queries, winding numbers and piece measures made, for timing checks. */
   queries = 0;
   windings = 0;
   evals = 0;
+  probes = 0;
 
   constructor(
     readonly hand: RiggedHand,
@@ -162,6 +360,12 @@ export class SkinGuard {
     this.vLink = new Uint8Array(total);
     this.P = new Float32Array(total * 3);
     this.meshMats = hand.meshes.map(() => new Matrix4());
+    this.bindPos = new Float64Array(total * 3);
+    this.skinBone = new Uint16Array(total * 4);
+    this.skinW = new Float64Array(total * 4);
+    this.boneMats = hand.meshes.map((m) => new Float64Array(16 * m.skeleton.bones.length));
+    this.boneVersion = hand.meshes.map((m) => new Uint32Array(m.skeleton.bones.length));
+    this.meshVersion = new Uint32Array(hand.meshes.length);
     const nPieces = model.fingers.length + 1;
     const palm = model.fingers.length;
     const pieceVerts: number[][] = Array.from({ length: nPieces }, () => []);
@@ -173,10 +377,19 @@ export class SkinGuard {
       const n = g.getAttribute('position').count;
       const si = g.getAttribute('skinIndex');
       const sw = g.getAttribute('skinWeight');
+      const position = g.getAttribute('position');
       for (let i = 0; i < n; i++) {
         let best = 0, w = -1;
         for (let k = 0; k < 4; k++) if (sw.getComponent(i, k) > w) ((w = sw.getComponent(i, k)), (best = si.getComponent(i, k)));
         const id = base + i;
+        _v.fromBufferAttribute(position, i).applyMatrix4(mesh.bindMatrix);
+        this.bindPos[id * 3] = _v.x;
+        this.bindPos[id * 3 + 1] = _v.y;
+        this.bindPos[id * 3 + 2] = _v.z;
+        for (let k = 0; k < 4; k++) {
+          this.skinBone[id * 4 + k] = si.getComponent(i, k);
+          this.skinW[id * 4 + k] = sw.getComponent(i, k);
+        }
         this.vMesh[id] = mi;
         this.vLocal[id] = i;
         this.vFinger[id] = best < jointFinger.length ? jointFinger[best] : -1;
@@ -213,7 +426,22 @@ export class SkinGuard {
       const links = p === palm ? 1 : model.fingers[p].joints.length;
       const radii = model.spheres.filter((x) => x.finger === (p === palm ? -1 : p)).map((x) => x.radius);
       const deepest = 1.6 * Math.max(0.005, ...radii) + 0.003;
-      return { verts: list, triLink: Uint8Array.from(pieceTriLink[p].length ? pieceTriLink[p] : [0]), geo, bvh: null as unknown as MeshBVH, links, deepest };
+      const deps = new Set<number>();
+      for (const v of list) for (let k = 0; k < 4; k++) if (this.skinW[v * 4 + k] !== 0) deps.add(this.vMesh[v] * BONE_KEY + this.skinBone[v * 4 + k]);
+      return {
+        verts: list,
+        triLink: Uint8Array.from(pieceTriLink[p].length ? pieceTriLink[p] : [0]),
+        geo,
+        bvh: null as unknown as MeshBVH,
+        links,
+        deepest,
+        deps: Uint32Array.from(deps),
+        posedAt: -1,
+        fitAt: -1,
+        ref: null,
+        drift: 0,
+        bound: new Float64Array(0),
+      };
     });
     // which way the skin's triangles face: test the finger joints, which lie inside the flesh, at rest
     const rest = new Float32Array(model.dofCount);
@@ -230,16 +458,46 @@ export class SkinGuard {
       });
     });
     this.skinSide = behind >= front ? 1 : -1;
-    for (const piece of this.pieces) this.pose(piece.verts);
+    for (let p = 0; p < this.pieces.length; p++) this.posePiece(p);
     this.whole = this.closeSkin();
     const P = object.positions;
-    this.objPts = edgePoints(P, object.index);
+    this.objPts = edgePoints(P, object.index, object.flip, object.watertight);
     this.objMin = new Vector3(Infinity, Infinity, Infinity);
     this.objMax = new Vector3(-Infinity, -Infinity, -Infinity);
     for (let i = 0; i < P.length; i += 3) {
       this.objMin.min(_v.set(P[i], P[i + 1], P[i + 2]));
       this.objMax.max(_v);
     }
+    this.grid = pointGrid(this.objPts, this.objMin, this.objMax);
+    for (const piece of this.pieces) piece.bound = new Float64Array(this.objPts.length / 3).fill(NOT_KNOWN);
+    this.refPos = new Float32Array(total * 3);
+    this.refDist = new Float64Array(total).fill(NOT_KNOWN);
+  }
+
+  /** The held thing's points that may lie in a box, in ascending order (the order they are always looked at in). */
+  private objNear(min: Vector3, max: Vector3): Int32Array {
+    const g = this.grid;
+    if (max.x < g.lo.x || max.y < g.lo.y || max.z < g.lo.z) return g.scratch.subarray(0, 0);
+    if (min.x > g.lo.x + g.nx * g.cell || min.y > g.lo.y + g.ny * g.cell || min.z > g.lo.z + g.nz * g.cell) return g.scratch.subarray(0, 0);
+    const at = (v: number, o: number, k: number) => Math.min(k - 1, Math.max(0, Math.floor((v - o) / g.cell)));
+    const x0 = at(min.x, g.lo.x, g.nx), x1 = at(max.x, g.lo.x, g.nx);
+    const y0 = at(min.y, g.lo.y, g.ny), y1 = at(max.y, g.lo.y, g.ny);
+    const z0 = at(min.z, g.lo.z, g.nz), z1 = at(max.z, g.lo.z, g.nz);
+    let count = 0;
+    for (let z = z0; z <= z1; z++)
+      for (let y = y0; y <= y1; y++) {
+        const row = (z * g.ny + y) * g.nx;
+        count += g.start[row + x1 + 1] - g.start[row + x0];
+      }
+    // most of the held thing: going through all of it in order is quicker than sorting
+    if (count > g.all.length / 4) return g.all;
+    let k = 0;
+    for (let z = z0; z <= z1; z++)
+      for (let y = y0; y <= y1; y++) {
+        const row = (z * g.ny + y) * g.nx;
+        for (let i = g.start[row + x0], end = g.start[row + x1 + 1]; i < end; i++) g.scratch[k++] = g.items[i];
+      }
+    return g.scratch.subarray(0, k).sort();
   }
 
   private pieceOf(v: number): number {
@@ -255,9 +513,39 @@ export class SkinGuard {
   private place(wrist: Matrix4, angles: Float32Array) {
     setHandPose(this.hand, { wrist, angles });
     const toObject = wrist.clone().multiply(this.hand.root.matrixWorld.clone().invert());
-    this.hand.meshes.forEach((m, i) => this.meshMats[i].multiplyMatrices(toObject, m.matrixWorld));
+    this.hand.meshes.forEach((m, i) => {
+      if (!sameMatrix(_m.multiplyMatrices(toObject, m.matrixWorld).elements, this.meshMats[i].elements, 0)) {
+        this.meshMats[i].copy(_m);
+        this.meshVersion[i] = ++this.version;
+      }
+      const bones = m.skeleton.bones, inverses = m.skeleton.boneInverses, A = this.boneMats[i], at = this.boneVersion[i];
+      for (let b = 0; b < bones.length; b++) {
+        const e = _m.multiplyMatrices(bones[b].matrixWorld, inverses[b]).elements;
+        if (sameMatrix(e, A, b * 16)) continue;
+        A.set(e, b * 16);
+        at[b] = ++this.version;
+      }
+    });
     this.wristSide = wrist.determinant() < 0 ? -1 : 1;
-    this.placed++;
+  }
+
+  /** Whether any bone that moves the piece, or the mesh it is in, has moved since pose version `since`. */
+  private movedSince(piece: Piece, since: number): boolean {
+    if (since < 0) return true;
+    if (since === this.version) return false;
+    for (let i = 0; i < piece.deps.length; i++) {
+      const mi = Math.floor(piece.deps[i] / BONE_KEY);
+      if (this.boneVersion[mi][piece.deps[i] % BONE_KEY] > since || this.meshVersion[mi] > since) return true;
+    }
+    return false;
+  }
+
+  /** Poses one piece's vertices where the hand is placed now (nothing to do when its bones have not moved since). */
+  private posePiece(p: number) {
+    const piece = this.pieces[p];
+    if (!this.movedSince(piece, piece.posedAt)) return;
+    this.pose(piece.verts);
+    piece.posedAt = this.version;
   }
 
   /**
@@ -266,8 +554,8 @@ export class SkinGuard {
    */
   private insideSkin(q: Vector3, key: number): boolean {
     const w = this.whole;
-    if (this.wholePosed !== this.placed) {
-      for (const piece of this.pieces) this.pose(piece.verts);
+    if (this.wholeAt !== this.version) {
+      for (let p = 0; p < this.pieces.length; p++) this.posePiece(p);
       const attr = w.geo.getAttribute('position') as BufferAttribute;
       const arr = attr.array as Float32Array;
       const n = this.P.length / 3;
@@ -282,7 +570,7 @@ export class SkinGuard {
       attr.needsUpdate = true;
       if (!w.bvh) w.bvh = new MeshBVH(w.geo);
       else w.bvh.refit();
-      this.wholePosed = this.placed;
+      this.wholeAt = this.version;
       this.inside.clear();
     }
     const known = this.inside.get(key);
@@ -345,20 +633,44 @@ export class SkinGuard {
     return { geo, bvh: null, loops: members.map((m) => Uint32Array.from(m)) };
   }
 
+  /**
+   * Poses vertices into P: three.js's SkinnedMesh.getVertexPosition followed by the mesh's place, written out (each bone's matrix
+   * made once per place() rather than once per vertex and weight), with every sum in the same order so the numbers are the same.
+   */
   private pose(ids: Uint32Array) {
-    const P = this.P;
+    const P = this.P, B = this.bindPos, SI = this.skinBone, SW = this.skinW;
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i];
       const mi = this.vMesh[id];
-      this.hand.meshes[mi].getVertexPosition(this.vLocal[id], _v).applyMatrix4(this.meshMats[mi]);
-      P[id * 3] = _v.x;
-      P[id * 3 + 1] = _v.y;
-      P[id * 3 + 2] = _v.z;
+      const A = this.boneMats[mi];
+      const bx = B[id * 3], by = B[id * 3 + 1], bz = B[id * 3 + 2];
+      let x = 0, y = 0, z = 0;
+      for (let k = 0; k < 4; k++) {
+        const weight = SW[id * 4 + k];
+        if (weight === 0) continue;
+        const o = SI[id * 4 + k] * 16;
+        const s = 1 / (A[o + 3] * bx + A[o + 7] * by + A[o + 11] * bz + A[o + 15]);
+        x += (A[o] * bx + A[o + 4] * by + A[o + 8] * bz + A[o + 12]) * s * weight;
+        y += (A[o + 1] * bx + A[o + 5] * by + A[o + 9] * bz + A[o + 13]) * s * weight;
+        z += (A[o + 2] * bx + A[o + 6] * by + A[o + 10] * bz + A[o + 14]) * s * weight;
+      }
+      let e = this.hand.meshes[mi].bindMatrixInverse.elements;
+      let s = 1 / (e[3] * x + e[7] * y + e[11] * z + e[15]);
+      const ux = (e[0] * x + e[4] * y + e[8] * z + e[12]) * s;
+      const uy = (e[1] * x + e[5] * y + e[9] * z + e[13]) * s;
+      const uz = (e[2] * x + e[6] * y + e[10] * z + e[14]) * s;
+      e = this.meshMats[mi].elements;
+      s = 1 / (e[3] * ux + e[7] * uy + e[11] * uz + e[15]);
+      P[id * 3] = (e[0] * ux + e[4] * uy + e[8] * uz + e[12]) * s;
+      P[id * 3 + 1] = (e[1] * ux + e[5] * uy + e[9] * uz + e[13]) * s;
+      P[id * 3 + 2] = (e[2] * ux + e[6] * uy + e[10] * uz + e[14]) * s;
     }
   }
 
   private refit(piece: Piece) {
-    this.pose(piece.verts);
+    if (!this.movedSince(piece, piece.fitAt)) return;
+    this.posePiece(this.pieces.indexOf(piece));
+    piece.fitAt = this.version;
     const a = piece.geo.getAttribute('position') as BufferAttribute;
     const arr = a.array as Float32Array;
     for (let i = 0; i < piece.verts.length; i++) {
@@ -368,8 +680,47 @@ export class SkinGuard {
       arr[i * 3 + 2] = this.P[id * 3 + 2];
     }
     a.needsUpdate = true;
-    if (!piece.bvh) piece.bvh = new MeshBVH(piece.geo);
+    if (!piece.bvh) piece.bvh = this.firstTree(piece);
     else piece.bvh.refit();
+    // how far the skin has moved since the bounds were taken; past half the margin they are taken again
+    const ref = piece.ref;
+    if (!ref) {
+      piece.ref = Float32Array.from(arr);
+      piece.drift = 0;
+      return;
+    }
+    let worst = 0;
+    for (let i = 0; i < arr.length; i += 3) {
+      const dx = arr[i] - ref[i], dy = arr[i + 1] - ref[i + 1], dz = arr[i + 2] - ref[i + 2];
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d > worst) worst = d;
+    }
+    piece.drift = Math.sqrt(worst);
+    if (piece.drift > PROBE / 2) {
+      ref.set(arr);
+      piece.drift = 0;
+      piece.bound.fill(NOT_KNOWN);
+    }
+  }
+
+  /**
+   * A piece's first tree. Building it sorts the piece's triangles, so which link each triangle belongs to is sorted the same way,
+   * found again by its three corners.
+   */
+  private firstTree(piece: Piece): MeshBVH {
+    const index = piece.geo.index!.array;
+    const was = new Map<string, number>();
+    const key = (t: number) => {
+      const a = index[t * 3], b = index[t * 3 + 1], c = index[t * 3 + 2];
+      return `${a},${b},${c}`;
+    };
+    for (let t = 0; t < index.length / 3; t++) was.set(key(t), piece.triLink[t]);
+    const bvh = new MeshBVH(piece.geo);
+    const sorted = piece.geo.index!.array;
+    const link = new Uint8Array(sorted.length / 3);
+    for (let t = 0; t < link.length; t++) link[t] = was.get(key(t)) ?? 0;
+    piece.triLink = link;
+    return bvh;
   }
 
   /**
@@ -378,13 +729,25 @@ export class SkinGuard {
    */
   private side(piece: { geo: BufferGeometry; bvh: MeshBVH }, q: Vector3, within: number): number {
     const h = piece.bvh.closestPointToPoint(q, _hit, 0, within);
-    if (!h || h.distance < 1e-7) return 0;
+    return h ? this.sideOf(piece, q, h) : 0;
+  }
+
+  /** The same, from the nearest point already found. */
+  private sideOf(piece: { geo: BufferGeometry; bvh: MeshBVH }, q: Vector3, h: { point: Vector3; distance: number; faceIndex: number }): number {
+    if (h.distance < 1e-7) return 0;
     const pos = piece.geo.getAttribute('position').array as Float32Array;
     const idx = piece.geo.index!.array as Uint32Array;
     const a = idx[h.faceIndex * 3] * 3, b = idx[h.faceIndex * 3 + 1] * 3, c = idx[h.faceIndex * 3 + 2] * 3;
     _ab.set(pos[b] - pos[a], pos[b + 1] - pos[a + 1], pos[b + 2] - pos[a + 2]);
     _ac.set(pos[c] - pos[a], pos[c + 1] - pos[a + 1], pos[c + 2] - pos[a + 2]);
     _n.crossVectors(_ab, _ac).normalize();
+    // on an edge or a corner the one triangle the tree found cannot say which side is out (another tree finds another): every face
+    // meeting there says, by the angle it takes up round the point
+    _A.set(pos[a], pos[a + 1], pos[a + 2]);
+    _B.set(pos[b], pos[b + 1], pos[b + 2]);
+    _C.set(pos[c], pos[c + 1], pos[c + 2]);
+    _at.copy(h.point);
+    if (onTriangleEdge(_at, _A, _B, _C) && facesAround(piece.bvh, _at, _sum)) _n.copy(_sum).normalize();
     _q.copy(q).sub(h.point).divideScalar(h.distance);
     const cos = _q.dot(_n) * (this.skinSide ?? 1) * this.wristSide;
     if (Math.abs(cos) < 0.3) return 0;
@@ -394,16 +757,25 @@ export class SkinGuard {
   /**
    * Measures one piece where the hand is now placed, from segment `fromLink` out. With `only`, just that segment; points no deeper
    * than `floor` are not looked at closely, and once one is found deeper than `stop` the measure ends there (enough for a yes or no).
+   * The gap is exact up to `gap` (metres); beyond that it is only known to be further.
+   *
+   * Most of the hand is about as far from the held thing as last time, give or take how far it has moved since, so a point is only
+   * measured again when that could change the answer (a distance changes no faster than the point moves): a skin point that was
+   * outside by more than it has moved since is still outside (on a closed held thing, whose inside and outside meet only at its
+   * surface), and a point of the held thing further than `REACH` from the skin by more than the skin has moved is still out of reach.
    */
-  private evalPiece(p: number, fromLink = 0, look: { only?: number; floor?: number; stop?: number } = {}): PieceEval {
+  private evalPiece(p: number, fromLink = 0, look: { only?: number; floor?: number; stop?: number; gap?: number } = {}): PieceEval {
     const only = look.only ?? -1, floor = look.floor ?? 0, stop = look.stop ?? Infinity;
     const collect = only < 0 && stop === Infinity;
     const piece = this.pieces[p];
     this.evals++;
     const out: PieceEval = { link: new Float64Array(piece.links), gap: Infinity, violations: [] };
     this.refit(piece);
-    const P = this.P;
+    const P = this.P, RP = this.refPos, RD = this.refDist;
     const lo = this.objMin, hi = this.objMax, m = 0.002;
+    const cache = this.object.watertight;
+    // a skin point surely further out than this needs no measuring: it is neither in the part nor setting a gap that is wanted
+    const need = Math.max(0, look.gap ?? 0) + 1e-6;
     const min = new Vector3(Infinity, Infinity, Infinity), max = new Vector3(-Infinity, -Infinity, -Infinity);
     // skin points inside the held thing
     for (let i = 0; i < piece.verts.length; i++) {
@@ -420,8 +792,21 @@ export class SkinGuard {
         out.gap = Math.min(out.gap, Math.hypot(bx, by, bz));
         continue;
       }
+      if (cache && RD[id] > need) {
+        const lower = RD[id] - Math.hypot(x - RP[id * 3], y - RP[id * 3 + 1], z - RP[id * 3 + 2]);
+        if (lower > need) {
+          if (lower < out.gap) out.gap = lower;
+          continue;
+        }
+      }
       this.queries++;
       const d = this.object.distance(x, y, z);
+      if (cache) {
+        RP[id * 3] = x;
+        RP[id * 3 + 1] = y;
+        RP[id * 3 + 2] = z;
+        RD[id] = d;
+      }
       if (d < out.gap) out.gap = d;
       if (d < 0) {
         if (-d > out.link[k]) out.link[k] = -d;
@@ -429,17 +814,26 @@ export class SkinGuard {
         if (-d > stop) return out;
       }
     }
-    // points of the held thing inside the skin: a thin edge between skin points
-    const reach = 0.012;
-    min.subScalar(reach);
-    max.addScalar(reach);
+    // points of the held thing inside the skin: a thin edge between skin points (none can count when none is looked at closely)
+    if (floor === Infinity) return out;
+    min.subScalar(REACH);
+    max.addScalar(REACH);
     const O = this.objPts;
-    for (let i = 0; i < O.length; i += 3) {
+    const found = this.objNear(min, max);
+    const bound = piece.bound, drift = piece.drift;
+    for (let c = 0; c < found.length; c++) {
+      const j = found[c], i = j * 3;
       const x = O[i], y = O[i + 1], z = O[i + 2];
       if (x < min.x || y < min.y || z < min.z || x > max.x || y > max.y || z > max.z) continue;
-      const s = this.side(piece, _q.set(x, y, z), reach);
+      if (bound[j] - drift > REACH + 1e-7) continue;
+      // looked for a little further than needed, so the answer says how long the point can be left alone
+      const h = piece.bvh.closestPointToPoint(_q.set(x, y, z), _hit, 0, REACH + PROBE);
+      this.probes++;
+      bound[j] = (h && h.distance < REACH + PROBE ? h.distance : REACH + PROBE) - drift;
+      if (!h || h.distance > REACH) continue;
+      const s = this.sideOf(piece, _q, h);
       if (s >= 0 || -s <= floor) continue;
-      const k = piece.triLink[_hit.faceIndex] ?? 0;
+      const k = piece.triLink[h.faceIndex] ?? 0;
       if (k < fromLink || (only >= 0 && k !== only)) continue;
       // a point no deeper than one already found changes nothing unless every point is wanted
       if (!collect && -s <= out.link[k]) continue;
@@ -461,7 +855,7 @@ export class SkinGuard {
     const depth = { thumb: 0, index: 0, middle: 0, ring: 0, little: 0, palm: 0 } as Record<SkinPart, number>;
     const gap = { thumb: Infinity, index: Infinity, middle: Infinity, ring: Infinity, little: Infinity, palm: Infinity } as Record<SkinPart, number>;
     for (let p = 0; p < this.pieces.length; p++) {
-      const e = this.evalPiece(p);
+      const e = this.evalPiece(p, 0, { gap: GAP_EXACT });
       const part = this.partOf(p);
       depth[part] = Math.max(depth[part], ...e.link);
       gap[part] = Math.min(gap[part], e.gap);
@@ -668,7 +1062,7 @@ export class SkinGuard {
     const f = model.fingers[fi];
     this.place(wrist, angles);
     // the skin's own points say how near a finger is: nothing else is needed for touching
-    const near = { floor: Infinity };
+    const near = { floor: Infinity, gap: contact };
     if (this.evalPiece(fi, 0, near).gap <= contact) return;
     const start = Float32Array.from(angles);
     const told = said.length;
