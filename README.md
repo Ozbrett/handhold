@@ -76,7 +76,8 @@ Each export works on the character that is already in your project, with its own
 | Unity | `.unitypackage` | Import it, select the character, **Tools > Handhold > Add grip to selected character** | [unity.md](docs/unity.md) |
 | Godot 4.3+ | `.zip` | Unpack it, add a **HandholdGrip** node under the `Skeleton3D`, drag the pose onto it | [godot.md](docs/godot.md) |
 | Blender | `.zip` | Select the armature and run the `.py`. Saved items arrive as Actions, poses in the Pose Library | [blender.md](docs/blender.md) |
-| Unreal and others | `.glb` | Import it. It carries the pose, the prop and every animation | [pose-format.md](docs/pose-format.md) |
+| Unreal 5 | `.glb` and `.pose.json` | Import the `.glb` onto your skeleton with **Import Only Animations**, and add a socket for the prop from the pose file | [unreal.md](docs/unreal.md) |
+| Others | `.glb` | Import it. It carries the pose, the prop and every animation | [pose-format.md](docs/pose-format.md) |
 
 In Unity and Godot, show anything you saved by its name:
 

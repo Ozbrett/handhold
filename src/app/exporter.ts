@@ -257,6 +257,21 @@ function fingerTracks(char: CharacterRig): KeyframeTrack[] {
   return tracks;
 }
 
+/**
+ * Each finger bone as the grip holds it now, as tracks that keep it there for a whole clip. Every clip carries them: an engine
+ * puts a bone that a clip leaves out back at its rest pose (Unreal does), which would open the hand.
+ */
+function heldFingers(char: CharacterRig): (duration: number) => KeyframeTrack[] {
+  const held = char.bones.flatMap((bone, i) =>
+    char.jointOf[i] === 0 ? [] : [{ name: bone.name, q: bone.quaternion.toArray(), p: char.free[i] ? bone.position.toArray() : null }],
+  );
+  return (duration) =>
+    held.flatMap(({ name, q, p }) => [
+      new QuaternionKeyframeTrack(`${name}.quaternion`, [0, duration], [...q, ...q]),
+      ...(p ? [new VectorKeyframeTrack(`${name}.position`, [0, duration], [...p, ...p])] : []),
+    ]);
+}
+
 const SWEEP_KEYS = 13;
 
 /** Where the object sits relative to the character's hand bone for a grip (hand bone in its rest pose). */
@@ -268,6 +283,46 @@ function objectInHandBone(char: CharacterRig, grasp: Grasp, object: Object3D): M
     .invert()
     .multiply(new Matrix4().copy(grasp.wrist).invert())
     .multiply(object.matrix);
+}
+
+/** Unreal's FRotator::NormalizeAxis: an angle in degrees brought into (-180, 180]. */
+function normalizeAxis(a: number): number {
+  a %= 360;
+  if (a > 180) a -= 360;
+  else if (a <= -180) a += 360;
+  return a;
+}
+
+/**
+ * Where the prop goes on the hand bone, as an Unreal socket's relative location (cm), rotation (roll, pitch, yaw in degrees) and
+ * scale. Unreal's glTF importer turns a position (x, y, z) into (x, z, y) and metres into centimetres, and a turn (x, y, z, w) into
+ * (-x, -z, -y, w); the rotation is then read off the way FQuat::Rotator does. `boneScale` is the hand bone's own scale in the file.
+ */
+export function unrealSocket(inHand: Matrix4, boneScale: number) {
+  const p = new Vector3(), q = new Quaternion(), s = new Vector3();
+  inHand.decompose(p, q, s);
+  const cm = 100 * boneScale;
+  const x = -q.x, y = -q.z, z = -q.y, w = q.w;
+  const deg = 180 / Math.PI;
+  const test = z * x - w * y;
+  const yaw = Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)) * deg;
+  let pitch: number, roll: number;
+  if (test < -0.4999995) {
+    pitch = -90;
+    roll = normalizeAxis(-yaw - 2 * Math.atan2(x, w) * deg);
+  } else if (test > 0.4999995) {
+    pitch = 90;
+    roll = normalizeAxis(yaw - 2 * Math.atan2(x, w) * deg);
+  } else {
+    pitch = Math.asin(2 * test) * deg;
+    roll = Math.atan2(-2 * (w * x + y * z), 1 - 2 * (x * x + y * y)) * deg;
+  }
+  const r = (v: number, k = 1e4) => Math.round(v * k) / k;
+  return {
+    location: [r(p.x * cm), r(p.z * cm), r(p.y * cm)],
+    rotation: { roll: r(roll), pitch: r(pitch), yaw: r(yaw) },
+    scale: [r(s.x * boneScale, 1e6), r(s.z * boneScale, 1e6), r(s.y * boneScale, 1e6)],
+  };
 }
 
 /**
@@ -306,6 +361,8 @@ export async function exportCharacterGlb(
   poseCharacter(char, model, grasp.angles);
   const support = armExport?.support ?? null;
   if (support) poseCharacter(support.char, support.model, support.grasp.angles);
+  const held = heldFingers(char);
+  const supportHeld = support ? heldFingers(support.char) : () => [];
   const animations: AnimationClip[] = [];
   if (options.includeAnimation) {
     animations.push(new AnimationClip('Grip', 1, [...fingerTracks(char), ...(support ? fingerTracks(support.char) : [])]));
@@ -333,7 +390,7 @@ export async function exportCharacterGlb(
         new AnimationClip(
           'Sweep',
           1,
-          bones.map((b, i) => new QuaternionKeyframeTrack(`${b.name}.quaternion`, times, values[i])),
+          [...bones.map((b, i) => new QuaternionKeyframeTrack(`${b.name}.quaternion`, times, values[i])), ...held(1), ...supportHeld(1)],
         ),
       );
     }
@@ -349,10 +406,12 @@ export async function exportCharacterGlb(
         bones.forEach((b, i) => values[i].push(...b.quaternion.toArray()));
         fingers.forEach((b, i) => fingerValues[i].push(...b.quaternion.toArray()));
       });
+      const duration = times[times.length - 1];
       animations.push(
-        new AnimationClip(clip.name, times[times.length - 1], [
+        new AnimationClip(clip.name, duration, [
           ...bones.map((b, i) => new QuaternionKeyframeTrack(`${b.name}.quaternion`, times, values[i])),
-          ...fingers.map((b, i) => new QuaternionKeyframeTrack(`${b.name}.quaternion`, times, fingerValues[i])),
+          ...held(duration),
+          ...(fingers.length ? fingers.map((b, i) => new QuaternionKeyframeTrack(`${b.name}.quaternion`, times, fingerValues[i])) : supportHeld(duration)),
         ]),
       );
     }
@@ -361,7 +420,7 @@ export async function exportCharacterGlb(
     for (const pose of armExport.poses ?? []) {
       placeArms(armExport, grasp, pose.hold);
       const values = bones.map((b) => [...b.quaternion.toArray(), ...b.quaternion.toArray()]);
-      animations.push(new AnimationClip(pose.name, 1 / CLIP_FPS, armTracks([0, 1 / CLIP_FPS], values)));
+      animations.push(new AnimationClip(pose.name, 1 / CLIP_FPS, [...armTracks([0, 1 / CLIP_FPS], values), ...held(1 / CLIP_FPS), ...supportHeld(1 / CLIP_FPS)]));
     }
     // a look: two one-second animations to blend by the view's pitch and yaw
     for (const look of armExport.looks ?? []) {
@@ -374,7 +433,7 @@ export async function exportCharacterGlb(
           times.push(k / (LOOK_KEYS - 1));
           bones.forEach((b, i) => values[i].push(...b.quaternion.toArray()));
         }
-        animations.push(new AnimationClip(`${look.name} ${suffix}`, 1, armTracks(times, values)));
+        animations.push(new AnimationClip(`${look.name} ${suffix}`, 1, [...armTracks(times, values), ...held(1), ...supportHeld(1)]));
       }
     }
     placeArms(armExport, grasp, hold);
@@ -431,10 +490,17 @@ export function characterPoseJson(
   const secondBones = support ? fingerBones(support.char) : null;
   let objectAtRest: ReturnType<typeof trs> | null = null;
   let objectInHand: ReturnType<typeof trs> | null = null;
+  let unreal: ({ socketBone: string } & ReturnType<typeof unrealSocket>) | null = null;
   if (object) {
     object.updateMatrix();
     objectAtRest = trs(new Matrix4().copy(grasp.wrist).invert().multiply(object.matrix));
-    objectInHand = trs(objectInHandBone(char, grasp, object));
+    const inHand = objectInHandBone(char, grasp, object);
+    objectInHand = trs(inHand);
+    // the hand bone's scale in the exported file, whose root is the model's root
+    char.root.updateMatrixWorld(true);
+    const boneScale = new Vector3();
+    new Matrix4().copy(char.root.parent?.matrixWorld ?? new Matrix4()).invert().multiply(char.handBone.matrixWorld).decompose(new Vector3(), new Quaternion(), boneScale);
+    unreal = { socketBone: fileName(char.handBone), ...unrealSocket(inHand, boneScale.x) };
   }
   let arm: Record<string, unknown> | null = null;
   let secondHand: Record<string, unknown> | null = null;
@@ -571,6 +637,8 @@ export function characterPoseJson(
     objectAtRest,
     // the same thing relative to the hand bone's own axes
     objectInHandBone: objectInHand,
+    // the same again as an Unreal socket on the hand bone, for the prop imported from its own glTF file
+    unreal,
     bones,
     restPoints,
     arm,

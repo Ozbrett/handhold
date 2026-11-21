@@ -23,6 +23,7 @@ The space is right-handed with Y up, as in glTF. Quaternions are `[x, y, z, w]`.
 | `restPoints` | The rest position of every bone named anywhere in the file |
 | `objectAtRest` | Where the prop sits in the model's space while the hand is at rest: `position`, `quaternion`, `scale` |
 | `objectInHandBone` | The same, relative to the hand bone |
+| `unreal` | The same again as an Unreal socket on the hand bone, for the prop imported into Unreal from its own glTF file: `socketBone`, `location` (cm), `rotation` (`roll`, `pitch`, `yaw` in degrees) and `scale`. See [unreal.md](unreal.md). Only on the model's own skeleton |
 | `fingerSegmentsTouching`, `fingerSegments` | How much of the fingers is on the prop |
 | `arm` | The arm, described below. Null for a bare hand |
 | `secondHand` | The second hand of a two-handed grip, otherwise null |

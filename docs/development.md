@@ -119,6 +119,20 @@ Unity -batchmode -nographics -quit -projectPath P -executeMethod HandholdCheck.R
 
 On the test character both pass with no measurable error, in Blender 5.1 and Unity 6000.6, in all three arm modes, with one hand and with two.
 
+**Unreal**
+
+Unreal takes the `.glb` and the pose file's `unreal` socket, with no script of ours (see [unreal.md](unreal.md)), so the check imports
+the `.glb` the way that guide says and compares each animation with the `.glb` bone for bone, and the prop on the socket with the prop
+in the `.glb`. It needs a project with the character's skeleton, and the character exported from that project as `.glb` (the
+mannequin: right-click `SKM_Manny_Simple`, **Asset Actions > Export**, glTF binary) given to `handhold.mjs --hand`:
+
+```bash
+UnrealEditor-Cmd P.uproject -run=pythonscript -script="scripts/check-unreal.py x.glb x.pose.json /Game/Characters/Mannequins/Meshes/SK_Mannequin" -unattended -nullrhi -nosplash -nosound -nopause -stdout -AllowStdOutLogVerbosity
+```
+
+It ends with `HH RESULT PASS` or `HH RESULT FAIL`. Unreal cannot export a skeletal mesh as FBX without a renderer, so export the
+character as glTF.
+
 **Godot**
 
 There is no check for Godot yet, and `godot/handhold_grip.gd` has not been run inside Godot. It mirrors the Unity component. A headless check like the two above is the most useful thing to add next.

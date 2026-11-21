@@ -944,6 +944,11 @@ export class Panel {
         h('button', { class: 'btn quiet', type: 'button', key: 'dl-glb', disabled: !chosen || s.exporting, onclick: a.downloadGlb }, 'GLB'),
         h('button', { class: 'btn quiet', type: 'button', key: 'dl-json', disabled: !chosen, onclick: a.downloadPose }, 'Pose JSON'),
       ),
+      h(
+        'p',
+        { class: 'note' },
+        'Unreal: download both. Import the GLB onto your skeleton with Import Only Animations, and put the prop on a socket from the "unreal" values in the Pose JSON (docs/unreal.md).',
+      ),
     ];
 
     // ---------- Character tab ----------
