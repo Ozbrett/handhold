@@ -262,8 +262,7 @@ if (!args.unreviewed) {
   const left = await reviewLeft(args.review);
   if (left.length) {
     console.log(`not final (review, or pass --unreviewed):
-  ${left.join('
-  ')}`);
+  ${left.join('\n  ')}`);
     process.exit(3);
   }
 }
